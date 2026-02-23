@@ -88,9 +88,9 @@ def get_theory_cls(results, lmax=1500):
     dict : keys are (i, j) tuples (0-indexed bin pairs, i <= j),
            values are C_ell arrays of length lmax+1.
     """
-    # get_source_cls_dict returns C_ell for the source windows
+    # get_source_cls_dict with raw_cl=True returns C_ell (not l(l+1)C_ell/(2pi))
     # Keys are like 'W1xW1', 'W1xW2', etc. (1-indexed)
-    cls_dict = results.get_source_cls_dict(lmax=lmax)
+    cls_dict = results.get_source_cls_dict(lmax=lmax, raw_cl=True)
 
     theory_cls = {}
     n_bins = len(results.Params.SourceWindows)
