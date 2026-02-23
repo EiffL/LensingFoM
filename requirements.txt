@@ -1,0 +1,8 @@
+numpy
+scipy
+healpy
+camb
+matplotlib
+astropy
+dorian-astro
+pymaster
