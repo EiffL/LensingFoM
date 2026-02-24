@@ -1,12 +1,14 @@
 """Build a HuggingFace dataset from extracted tiles on the Modal volume.
 
-Runs on Modal for direct volume access. Builds parquet shards per lmax,
-then pushes to HuggingFace Hub.
+Runs on Modal for direct volume access. Builds parquet shards per
+(lmax, noise_level), then pushes to HuggingFace Hub.
 
 Usage:
-    # Build parquet shards on the volume (one lmax at a time, or all)
-    modal run scripts/build_hf_dataset.py --lmax 200
-    modal run scripts/build_hf_dataset.py  # all lmax values
+    # Build parquet shards (all configs)
+    modal run scripts/build_hf_dataset.py
+
+    # Build for a specific config
+    modal run scripts/build_hf_dataset.py --lmax 200 --noise-level des_y3
 
     # Push to HuggingFace Hub (requires HF_TOKEN secret on Modal)
     modal run scripts/build_hf_dataset.py --push
@@ -19,6 +21,7 @@ import modal
 
 LMAX_VALUES = [200, 400, 600, 800, 1000]
 LMAX_TO_NSIDE = {200: 128, 400: 256, 600: 256, 800: 512, 1000: 512}
+NOISE_LEVELS = ["noiseless", "des_y3", "lsst_y10"]
 N_TILES = 12  # 3 orientations x 4 equatorial tiles
 SIMS_PER_SHARD = 50
 
@@ -64,15 +67,15 @@ def load_cosmo_params(csv_path):
     timeout=3600,
     memory=8192,
 )
-def build_parquet_for_lmax(lmax: int) -> dict:
-    """Build parquet shards for one lmax value, saved to the volume."""
+def build_parquet_for_config(lmax: int, noise_level: str) -> dict:
+    """Build parquet shards for one (lmax, noise_level) combination."""
     import numpy as np
     from datasets import Dataset
 
     cosmo_params = load_cosmo_params(CSV_PATH)
     nside = LMAX_TO_NSIDE[lmax]
 
-    out_dir = Path(RESULTS_DIR) / "hf_dataset" / f"lmax_{lmax}"
+    out_dir = Path(RESULTS_DIR) / "hf_dataset" / f"lmax_{lmax}_{noise_level}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     total_tiles = 0
@@ -85,7 +88,7 @@ def build_parquet_for_lmax(lmax: int) -> dict:
 
         for sim_id in range(shard_start, shard_end):
             sim_tag = f"sim{sim_id:05d}"
-            npz_path = Path(RESULTS_DIR) / sim_tag / f"tiles_lmax{lmax}.npz"
+            npz_path = Path(RESULTS_DIR) / sim_tag / f"tiles_lmax{lmax}_noise_{noise_level}.npz"
 
             if not npz_path.exists():
                 skipped += 1
@@ -105,6 +108,7 @@ def build_parquet_for_lmax(lmax: int) -> dict:
                     "sim_id": sim_id,
                     "orientation_id": tile_idx // 4,
                     "tile_id": tile_idx % 4,
+                    "noise_level": noise_level,
                     "Omega_m": cp["Omega_m"],
                     "sigma_8": cp["sigma_8"],
                     "S8": cp["S8"],
@@ -120,70 +124,28 @@ def build_parquet_for_lmax(lmax: int) -> dict:
             ds = Dataset.from_list(records)
             ds.to_parquet(str(shard_path))
             total_tiles += len(records)
-            print(f"lmax={lmax}: wrote {shard_path.name} ({len(records)} tiles, sims {shard_start}-{shard_end - 1})")
+            print(f"lmax={lmax}/{noise_level}: wrote {shard_path.name} ({len(records)} tiles, sims {shard_start}-{shard_end - 1})")
             del records, ds
         shard_idx += 1
 
     vol.commit()
-    print(f"lmax={lmax}: done — {total_tiles} tiles in {shard_idx} shards, {skipped} sims skipped")
-    return {"lmax": lmax, "total_tiles": total_tiles, "shards": shard_idx, "skipped": skipped}
-
-
-@app.function(
-    volumes={RESULTS_DIR: vol},
-    timeout=3600,
-    memory=4096,
-)
-def push_to_hub(repo_id: str = "EiffL/GowerStreetDESY3") -> dict:
-    """Push all parquet shards to HuggingFace Hub.
-
-    Requires HF_TOKEN environment variable (set via Modal secret or env).
-    """
-    import os
-    from huggingface_hub import HfApi
-
-    token = os.environ.get("HF_TOKEN")
-    api = HfApi(token=token)
-    api.create_repo(repo_id, repo_type="dataset", exist_ok=True)
-
-    hf_dir = Path(RESULTS_DIR) / "hf_dataset"
-    pushed = {}
-
-    for lmax in LMAX_VALUES:
-        lmax_dir = hf_dir / f"lmax_{lmax}"
-        if not lmax_dir.exists():
-            print(f"lmax={lmax}: no parquet shards found, skipping")
-            continue
-
-        parquet_files = sorted(lmax_dir.glob("shard_*.parquet"))
-        if not parquet_files:
-            continue
-
-        for pf in parquet_files:
-            api.upload_file(
-                path_or_fileobj=str(pf),
-                path_in_repo=f"data/lmax_{lmax}/{pf.name}",
-                repo_id=repo_id,
-                repo_type="dataset",
-            )
-
-        pushed[lmax] = len(parquet_files)
-        print(f"lmax={lmax}: pushed {len(parquet_files)} shards to {repo_id}")
-
-    return {"repo_id": repo_id, "pushed": pushed}
+    print(f"lmax={lmax}/{noise_level}: done — {total_tiles} tiles in {shard_idx} shards, {skipped} sims skipped")
+    return {"lmax": lmax, "noise_level": noise_level, "total_tiles": total_tiles, "shards": shard_idx, "skipped": skipped}
 
 
 @app.local_entrypoint()
-def main(lmax: int = None, push: bool = False):
+def main(lmax: int = None, noise_level: str = None, push: bool = False):
     if push:
-        result = push_to_hub.remote()
-        print(result)
-    elif lmax is not None:
-        result = build_parquet_for_lmax.remote(lmax)
+        print("Use scripts/push_hf_dataset.py for pushing to HuggingFace Hub.")
+        return
+
+    if lmax is not None and noise_level is not None:
+        result = build_parquet_for_config.remote(lmax, noise_level)
         print(result)
     else:
-        # Build all lmax values
-        results = list(build_parquet_for_lmax.map(LMAX_VALUES))
+        # Build all (lmax, noise_level) combinations
+        configs = [(l, n) for l in LMAX_VALUES for n in NOISE_LEVELS]
+        results = list(build_parquet_for_config.starmap(configs))
         for r in results:
             print(r)
-        print("\nAll parquet shards built. Run with --push to upload to HuggingFace Hub.")
+        print(f"\nAll {len(configs)} configs built. Use scripts/push_hf_dataset.py to upload.")
