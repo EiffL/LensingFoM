@@ -19,11 +19,11 @@ class VMIMCompressor(L.LightningModule):
         input_dim=200,
         summary_dim=2,
         theta_dim=2,
-        hidden_dim=64,
-        dropout=0.3,
+        hidden_dim=256,
+        dropout=0.2,
         full_cov=False,
-        lr=5e-4,
-        weight_decay=1e-2,
+        lr=2e-4,
+        weight_decay=2e-3,
         theta_std=None,
     ):
         super().__init__()

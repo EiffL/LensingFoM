@@ -1,9 +1,9 @@
-"""Train VMIM compressor on real power spectra from Gower Street simulations.
+"""Train field-level VMIM compressor on convergence map tiles.
 
 Usage:
-    modal run scripts/train_compressor.py
-    modal run scripts/train_compressor.py --lmax 400 --noise-level des_y3
-    modal run scripts/train_compressor.py --hidden-dim 128 --dropout 0.1 --weight-decay 1e-2
+    modal run scripts/train_field_compressor.py
+    modal run scripts/train_field_compressor.py --lmax 200 --noise-level des_y3
+    modal run scripts/train_field_compressor.py --backbone efficientnet_b0 --batch-size 128
 """
 
 import modal
@@ -12,12 +12,12 @@ image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install(
         "numpy", "pyarrow", "datasets",
-        "torch", "lightning", "wandb",
+        "torch", "torchvision", "lightning", "wandb",
     )
     .add_local_python_source("lensing")
 )
 
-app = modal.App("lensing-train-compressor", image=image)
+app = modal.App("lensing-train-field-compressor", image=image)
 vol = modal.Volume.from_name("lensing-results", create_if_missing=True)
 RESULTS_DIR = "/results"
 
@@ -25,23 +25,22 @@ RESULTS_DIR = "/results"
 @app.function(
     volumes={RESULTS_DIR: vol},
     gpu="A100",
-    timeout=3600,
-    memory=16384,
+    timeout=7200,
+    memory=32768,
     secrets=[modal.Secret.from_name("wandb-secret")],
 )
 def train_and_evaluate(
     lmax: int = 200,
     noise_level: str = "des_y3",
-    max_epochs: int = 2000,
-    lr: float = 2e-4,
-    hidden_dim: int = 256,
+    max_epochs: int = 200,
+    lr: float = 5e-4,
     summary_dim: int = 2,
+    backbone: str = "efficientnet_v2_s",
     full_cov: bool = False,
-    batch_size: int = 256,
-    dropout: float = 0.2,
-    weight_decay: float = 2e-3,
+    batch_size: int = 64,
+    weight_decay: float = 1e-4,
 ):
-    """Train VMIM compressor, log loss and FoM to wandb."""
+    """Train field-level VMIM compressor, log loss and FoM to wandb."""
     import json
     import time
     from pathlib import Path
@@ -52,8 +51,8 @@ def train_and_evaluate(
     from lightning.pytorch.callbacks import ModelCheckpoint
     from lightning.pytorch.loggers import WandbLogger
 
-    from lensing.sbi.compressor import VMIMCompressor
-    from lensing.sbi.dataset import SpectraDataModule
+    from lensing.sbi.field_compressor import FieldLevelCompressor
+    from lensing.sbi.tile_dataset import LMAX_TO_NSIDE, TileDataModule
 
     t0 = time.time()
 
@@ -62,37 +61,35 @@ def train_and_evaluate(
         torch.set_float32_matmul_precision("high")
 
     # --- Load data ---
-    parquet_path = Path(RESULTS_DIR) / "spectra_dataset" / f"spectra_lmax{lmax}_noise_{noise_level}.parquet"
-    if not parquet_path.exists():
+    nside = LMAX_TO_NSIDE[lmax]
+    parquet_dir = Path(RESULTS_DIR) / "hf_dataset" / f"lmax_{lmax}_{noise_level}"
+    if not parquet_dir.exists():
         raise FileNotFoundError(
-            f"{parquet_path} not found. Run pipeline.py --stage 5 first."
+            f"{parquet_dir} not found. Run pipeline.py --stage 3 first."
         )
 
-    dm = SpectraDataModule(parquet_path, batch_size=batch_size)
+    dm = TileDataModule(parquet_dir, batch_size=batch_size)
     dm.setup()
 
     n_train = len(dm.train_ds)
     n_val = len(dm.val_ds)
     n_test = len(dm.test_ds)
-    input_dim = dm.train_ds.spectra.shape[1]
 
-    print(f"Loaded {n_train + n_val + n_test} tiles from {parquet_path.name}")
+    print(f"Loaded {n_train + n_val + n_test} tiles from {parquet_dir}")
     print(f"Split: {n_train} train / {n_val} val / {n_test} test")
-    print(f"Input dim: {input_dim}")
+    print(f"Tile shape: (4, {nside}, {nside})")
 
     # --- Build model ---
-    tag = f"vmim_lmax{lmax}_{noise_level}_h{hidden_dim}_d{dropout}_wd{weight_decay}"
-    if full_cov:
-        tag += "_fullcov"
-    run_dir = Path(RESULTS_DIR) / "compressor_runs" / tag
+    tag = f"field_lmax{lmax}_{noise_level}_{backbone}_s{summary_dim}"
+    run_dir = Path(RESULTS_DIR) / "field_compressor_runs" / tag
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    model = VMIMCompressor(
-        input_dim=input_dim,
+    model = FieldLevelCompressor(
+        nside=nside,
+        n_bins=4,
         summary_dim=summary_dim,
         theta_dim=2,
-        hidden_dim=hidden_dim,
-        dropout=dropout,
+        backbone=backbone,
         full_cov=full_cov,
         lr=lr,
         weight_decay=weight_decay,
@@ -102,11 +99,11 @@ def train_and_evaluate(
     wandb_logger = WandbLogger(
         project="LensingFoM", entity="eiffl", name=tag,
         config=dict(
-            lmax=lmax, noise_level=noise_level, input_dim=input_dim,
+            lmax=lmax, noise_level=noise_level, nside=nside,
             n_train=n_train, n_val=n_val, n_test=n_test,
-            summary_dim=summary_dim, hidden_dim=hidden_dim, full_cov=full_cov,
+            summary_dim=summary_dim, backbone=backbone, full_cov=full_cov,
             lr=lr, batch_size=batch_size, max_epochs=max_epochs,
-            dropout=dropout, weight_decay=weight_decay,
+            weight_decay=weight_decay,
         ),
         save_dir=str(run_dir),
     )
@@ -130,7 +127,7 @@ def train_and_evaluate(
     # --- Evaluate on all splits ---
     best_path = ckpt_callback.best_model_path
     if best_path:
-        model = VMIMCompressor.load_from_checkpoint(
+        model = FieldLevelCompressor.load_from_checkpoint(
             best_path, theta_std=dm.train_ds.theta_std, weights_only=False,
         )
     model = model.cpu().eval()
@@ -151,10 +148,10 @@ def train_and_evaluate(
     })
 
     result = dict(
-        lmax=lmax, noise_level=noise_level, input_dim=input_dim,
+        lmax=lmax, noise_level=noise_level, nside=nside,
         n_train=n_train, n_val=n_val, n_test=n_test,
-        summary_dim=summary_dim, hidden_dim=hidden_dim, full_cov=full_cov,
-        lr=lr, batch_size=batch_size, dropout=dropout, weight_decay=weight_decay,
+        summary_dim=summary_dim, backbone=backbone, full_cov=full_cov,
+        lr=lr, batch_size=batch_size, weight_decay=weight_decay,
         train_loss=splits["train"]["loss"], train_fom=splits["train"]["fom"],
         val_loss=splits["val"]["loss"], val_fom=splits["val"]["fom"],
         test_loss=splits["test"]["loss"], test_fom=splits["test"]["fom"],
@@ -163,12 +160,6 @@ def train_and_evaluate(
     )
     with open(run_dir / "result.json", "w") as f:
         json.dump(result, f, indent=2)
-
-    # Append to sweep results JSONL
-    sweep_path = Path(RESULTS_DIR) / "compressor_runs" / "sweep_results.jsonl"
-    sweep_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(sweep_path, "a") as f:
-        f.write(json.dumps(result) + "\n")
 
     vol.commit()
     wandb.finish()
@@ -181,20 +172,19 @@ def train_and_evaluate(
 def main(
     lmax: int = 200,
     noise_level: str = "des_y3",
-    max_epochs: int = 2000,
-    lr: float = 2e-4,
-    hidden_dim: int = 256,
+    max_epochs: int = 200,
+    lr: float = 5e-4,
     summary_dim: int = 2,
+    backbone: str = "efficientnet_v2_s",
     full_cov: bool = False,
-    batch_size: int = 256,
-    dropout: float = 0.2,
-    weight_decay: float = 2e-3,
+    batch_size: int = 64,
+    weight_decay: float = 1e-4,
 ):
     result = train_and_evaluate.remote(
         lmax=lmax, noise_level=noise_level,
-        max_epochs=max_epochs, lr=lr, hidden_dim=hidden_dim,
-        summary_dim=summary_dim, full_cov=full_cov,
-        batch_size=batch_size, dropout=dropout, weight_decay=weight_decay,
+        max_epochs=max_epochs, lr=lr, summary_dim=summary_dim,
+        backbone=backbone, full_cov=full_cov,
+        batch_size=batch_size, weight_decay=weight_decay,
     )
     print(f"\nTrain FoM: {result['train_fom']:.1f}  Val FoM: {result['val_fom']:.1f}  Test FoM: {result['test_fom']:.1f}")
     print(f"Trained {result['epochs_trained']} epochs in {result['elapsed_s']:.0f}s")

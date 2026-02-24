@@ -1,0 +1,117 @@
+"""Parquet tile loading, normalization, and 3-way split for field-level SBI."""
+
+import numpy as np
+import torch
+from datasets import load_dataset
+from torch.utils.data import DataLoader, TensorDataset
+
+import lightning as L
+
+LMAX_TO_NSIDE = {200: 128, 400: 256, 600: 256, 800: 512, 1000: 512}
+
+
+def load_tiles_parquet(parquet_dir):
+    """Load tile images + cosmo params from parquet shards on the volume.
+
+    Parameters
+    ----------
+    parquet_dir : str or Path
+        Directory containing shard_*.parquet files
+        (e.g. /results/hf_dataset/lmax_200_des_y3/).
+
+    Returns
+    -------
+    tiles : np.ndarray, shape (N, 4, nside, nside)
+    theta : np.ndarray, shape (N, 2)  — [Omega_m, S8]
+    """
+    from pathlib import Path
+    shards = sorted(Path(parquet_dir).glob("shard_*.parquet"))
+    ds = load_dataset("parquet", data_files=[str(s) for s in shards], split="train")
+    ds = ds.with_format("numpy")
+    tiles = np.array(ds["kappa"], dtype=np.float32)
+    theta = np.column_stack([ds["Omega_m"], ds["S8"]]).astype(np.float32)
+    return tiles, theta
+
+
+class TileDataset:
+    """Normalized tiles + theta, with stats kept for un-normalization."""
+
+    def __init__(self, tiles, theta, tile_mean, tile_std, theta_mean, theta_std):
+        self.tiles = (tiles - tile_mean[None, :, None, None]) / tile_std[None, :, None, None]
+        self.theta = (theta - theta_mean) / theta_std
+        self.tile_mean = tile_mean
+        self.tile_std = tile_std
+        self.theta_mean = theta_mean
+        self.theta_std = theta_std
+
+    def __len__(self):
+        return len(self.tiles)
+
+    def tensors(self):
+        """Return (tiles, theta) as float32 tensors."""
+        return (
+            torch.tensor(self.tiles, dtype=torch.float32),
+            torch.tensor(self.theta, dtype=torch.float32),
+        )
+
+
+class TileDataModule(L.LightningDataModule):
+    """Lightning DataModule for tile images from HuggingFace dataset.
+
+    3-way split (60/20/20%), shuffled. Same logic as SpectraDataModule.
+    Per-channel normalization stats computed from train split only.
+    """
+
+    def __init__(self, parquet_dir, batch_size=64, seed=42):
+        super().__init__()
+        self.parquet_dir = parquet_dir
+        self.batch_size = batch_size
+        self.seed = seed
+        self.train_ds = None
+        self.val_ds = None
+        self.test_ds = None
+
+    def setup(self, stage=None):
+        tiles, theta = load_tiles_parquet(self.parquet_dir)
+
+        # Shuffle and split 60/20/20 — mirrors SpectraDataModule exactly
+        rng = np.random.default_rng(self.seed)
+        idx = np.arange(len(theta))
+        rng.shuffle(idx)
+
+        tiles = tiles[idx]
+        theta = theta[idx]
+
+        n = len(idx)
+        n_train = int(0.6 * n)
+        n_val = int(0.2 * n)
+
+        train_mask = np.zeros(n, dtype=bool)
+        train_mask[:n_train] = True
+        val_mask = np.zeros(n, dtype=bool)
+        val_mask[n_train:n_train + n_val] = True
+        test_mask = np.zeros(n, dtype=bool)
+        test_mask[n_train + n_val:] = True
+
+        # Per-channel normalization stats from train split
+        tile_mean = tiles[train_mask].mean(axis=(0, 2, 3))  # (4,)
+        tile_std = tiles[train_mask].std(axis=(0, 2, 3))     # (4,)
+        tile_std = np.where(tile_std == 0, 1.0, tile_std)
+
+        theta_mean = theta[train_mask].mean(axis=0)
+        theta_std = theta[train_mask].std(axis=0)
+        theta_std = np.where(theta_std == 0, 1.0, theta_std)
+
+        norm = (tile_mean, tile_std, theta_mean, theta_std)
+
+        self.train_ds = TileDataset(tiles[train_mask], theta[train_mask], *norm)
+        self.val_ds = TileDataset(tiles[val_mask], theta[val_mask], *norm)
+        self.test_ds = TileDataset(tiles[test_mask], theta[test_mask], *norm)
+
+    def train_dataloader(self):
+        x, y = self.train_ds.tensors()
+        return DataLoader(TensorDataset(x, y), batch_size=self.batch_size, shuffle=True, num_workers=4, persistent_workers=True)
+
+    def val_dataloader(self):
+        x, y = self.val_ds.tensors()
+        return DataLoader(TensorDataset(x, y), batch_size=self.batch_size, num_workers=4, persistent_workers=True)

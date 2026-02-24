@@ -62,6 +62,7 @@ class FieldLevelCompressor(L.LightningModule):
         full_cov=False,
         lr=5e-4,
         weight_decay=1e-4,
+        warmup_epochs=0,
         theta_std=None,
     ):
         super().__init__()
@@ -186,7 +187,7 @@ class FieldLevelCompressor(L.LightningModule):
         return loss, fom_phys
 
     def _augment(self, x):
-        """Random augmentation for training: 90-degree rotations + flips.
+        """Random augmentation for training: rotations, flips, and circular rolls.
 
         Parameters
         ----------
@@ -206,6 +207,10 @@ class FieldLevelCompressor(L.LightningModule):
         # Random vertical flip
         if torch.rand(1).item() > 0.5:
             x = torch.flip(x, dims=[2])
+        # Random circular rolls along both spatial dims
+        H, W = x.shape[2], x.shape[3]
+        x = torch.roll(x, shifts=torch.randint(0, H, (1,)).item(), dims=2)
+        x = torch.roll(x, shifts=torch.randint(0, W, (1,)).item(), dims=3)
         return x
 
     def training_step(self, batch, batch_idx):
@@ -214,6 +219,7 @@ class FieldLevelCompressor(L.LightningModule):
         loss, fom = self._nll_and_fom(x, theta)
         self.log("train_loss", loss, prog_bar=True)
         self.log("train_fom_median", fom.median(), prog_bar=False)
+        self.log("lr", self.optimizers().param_groups[0]["lr"], prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
