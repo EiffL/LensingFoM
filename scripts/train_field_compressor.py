@@ -121,6 +121,7 @@ def train_and_evaluate(
         enable_model_summary=False,
         logger=wandb_logger,
         accelerator="auto",
+        precision="bf16-mixed",
     )
     trainer.fit(model, dm)
 
@@ -172,12 +173,12 @@ def train_and_evaluate(
 def main(
     lmax: int = 200,
     noise_level: str = "des_y3",
-    max_epochs: int = 200,
+    max_epochs: int = 1000,
     lr: float = 5e-4,
-    summary_dim: int = 2,
+    summary_dim: int = 4,
     backbone: str = "efficientnet_v2_s",
     full_cov: bool = False,
-    batch_size: int = 64,
+    batch_size: int = 128,
     weight_decay: float = 1e-4,
 ):
     result = train_and_evaluate.remote(

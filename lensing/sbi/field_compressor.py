@@ -56,7 +56,7 @@ class FieldLevelCompressor(L.LightningModule):
         self,
         nside=128,
         n_bins=4,
-        summary_dim=2,
+        summary_dim=4,
         theta_dim=2,
         backbone="efficientnet_v2_s",
         full_cov=False,
@@ -96,9 +96,9 @@ class FieldLevelCompressor(L.LightningModule):
             nn.Flatten(),
         )
         self.compressor_head = nn.Sequential(
-            nn.Linear(backbone_dim, 128),
+            nn.Linear(backbone_dim, 64),
             nn.GELU(),
-            nn.Linear(128, summary_dim),
+            nn.Linear(64, summary_dim),
         )
 
         # VMIM head — same structure as VMIMCompressor
