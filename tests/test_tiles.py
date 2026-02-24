@@ -147,3 +147,32 @@ def test_add_shape_noise_deterministic():
     noisy1 = add_shape_noise(m, 1.5, 0.26, rng=np.random.default_rng(42))
     noisy2 = add_shape_noise(m, 1.5, 0.26, rng=np.random.default_rng(42))
     np.testing.assert_array_equal(noisy1, noisy2)
+
+
+def test_extract_tiles_for_lmax_with_noise():
+    """extract_tiles_for_lmax with noise should produce different tiles than noiseless."""
+    nside = 64
+    lmax = 200
+    np.random.seed(42)
+    m = np.random.randn(hp.nside2npix(nside))
+
+    tiles_clean = extract_tiles_for_lmax(m, lmax)
+    tiles_noisy = extract_tiles_for_lmax(
+        m, lmax, noise_level="des_y3", bin_index=0, rng=np.random.default_rng(99)
+    )
+
+    assert tiles_clean.shape == tiles_noisy.shape
+    assert not np.allclose(tiles_clean, tiles_noisy)
+
+
+def test_extract_tiles_for_lmax_noiseless_unchanged():
+    """Default (no noise args) should produce identical output to current behavior."""
+    nside = 64
+    lmax = 200
+    np.random.seed(42)
+    m = np.random.randn(hp.nside2npix(nside))
+
+    tiles_default = extract_tiles_for_lmax(m, lmax)
+    tiles_explicit = extract_tiles_for_lmax(m, lmax, noise_level="noiseless")
+
+    np.testing.assert_array_equal(tiles_default, tiles_explicit)

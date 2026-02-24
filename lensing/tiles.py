@@ -133,7 +133,7 @@ def filter_and_rotate(hpx_map, lmax_cut, euler_angles=(0, 0, 0)):
     return hp.alm2map(alm, nside_down)
 
 
-def extract_tiles_for_lmax(hpx_map, lmax_cut):
+def extract_tiles_for_lmax(hpx_map, lmax_cut, noise_level="noiseless", bin_index=0, rng=None):
     """Extract all 12 equatorial tiles (3 orientations x 4 tiles) for one lmax.
 
     Parameters
@@ -142,6 +142,12 @@ def extract_tiles_for_lmax(hpx_map, lmax_cut):
         Full-sky RING-ordered HEALPix map.
     lmax_cut : int
         Maximum multipole.
+    noise_level : str
+        Noise level: "noiseless", "des_y3", or "lsst_y10".
+    bin_index : int
+        Tomographic bin index (0-3), used to look up per-bin noise params.
+    rng : np.random.Generator or None
+        Random generator for noise. Required when noise_level != "noiseless".
 
     Returns
     -------
@@ -151,6 +157,16 @@ def extract_tiles_for_lmax(hpx_map, lmax_cut):
     """
     nside_down = LMAX_TO_NSIDE[lmax_cut]
     tiles = np.empty((12, nside_down, nside_down), dtype=np.float32)
+
+    # Add noise to the full-sky map before filtering
+    if noise_level != "noiseless":
+        cfg = NOISE_CONFIGS[noise_level]
+        hpx_map = add_shape_noise(
+            hpx_map,
+            n_eff_arcmin2=cfg["n_eff_arcmin2"][bin_index],
+            sigma_e=cfg["sigma_e"][bin_index],
+            rng=rng,
+        )
 
     for ori_idx, euler_angles in enumerate(ORIENTATIONS):
         filtered = filter_and_rotate(hpx_map, lmax_cut, euler_angles)
