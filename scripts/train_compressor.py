@@ -91,7 +91,6 @@ def train_and_evaluate(
         hidden_dim=hidden_dim,
         full_cov=full_cov,
         lr=lr,
-        weight_decay=1e-4,
         theta_std=dm.train_ds.theta_std,
     )
 

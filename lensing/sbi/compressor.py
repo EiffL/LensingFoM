@@ -19,10 +19,11 @@ class VMIMCompressor(L.LightningModule):
         input_dim=200,
         summary_dim=2,
         theta_dim=2,
-        hidden_dim=256,
+        hidden_dim=128,
+        dropout=0.3,
         full_cov=False,
         lr=5e-4,
-        weight_decay=1e-4,
+        weight_decay=1e-2,
         theta_std=None,
     ):
         super().__init__()
@@ -32,17 +33,16 @@ class VMIMCompressor(L.LightningModule):
         else:
             self.theta_std = None
 
-        # Compressor MLP with LayerNorm
+        # Compressor MLP: smaller + dropout
         self.compressor = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, 128),
-            nn.LayerNorm(128),
-            nn.GELU(),
-            nn.Linear(128, 64),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, 64),
             nn.LayerNorm(64),
             nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(64, summary_dim),
         )
 
