@@ -99,7 +99,6 @@ class VMIMCompressor(L.LightningModule):
         """Compute Gaussian NLL and per-sample FoM."""
         t = self.compressor(x)
         mu, L_or_sigma = self._predict_posterior(t)
-        d = self.hparams.theta_dim
 
         if self.hparams.full_cov:
             L = L_or_sigma
@@ -147,16 +146,8 @@ class VMIMCompressor(L.LightningModule):
         )
 
     @torch.no_grad()
-    def compress(self, dataset):
-        """Compress a full SpectraDataset, returning numpy arrays."""
-        self.eval()
-        x = torch.tensor(dataset.spectra, dtype=torch.float32, device=self.device)
-        summaries = self.compressor(x).cpu().numpy()
-        return summaries, dataset.theta_raw
-
-    @torch.no_grad()
-    def compress_arrays(self, spectra):
-        """Compress raw spectra arrays (already normalized).
+    def compress(self, spectra):
+        """Compress normalized spectra to low-dim summaries.
 
         Parameters
         ----------
