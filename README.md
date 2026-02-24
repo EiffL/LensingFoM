@@ -123,15 +123,34 @@ Full-sky convergence maps are filtered in harmonic space and projected onto flat
 
 ### Shape noise levels
 
-Tiles are generated at 3 noise levels to study the impact of survey depth on constraining power:
+Tiles are generated at 3 noise levels to study the impact of survey depth on constraining power.
 
-| Noise level | Survey | n_eff (arcmin^-2/bin) | sigma_e |
-|-------------|--------|----------------------|---------|
-| `noiseless` | — | — | — |
-| `des_y3` | DES Y3 | 1.46–1.48 | 0.24–0.30 |
-| `lsst_y10` | LSST Y10 | 6.75 | 0.26 |
+**Noise model.** Shape noise in convergence maps arises from the intrinsic ellipticity dispersion of source galaxies. For a HEALPix pixel at resolution nside, the noise standard deviation per pixel per tomographic bin is:
 
-Shape noise is added as Gaussian pixel noise to the full-sky nside=1024 convergence map **before** harmonic filtering, so the noise is band-limited consistently with the signal. DES Y3 values from [Amon et al. 2022](https://arxiv.org/abs/2105.13543), LSST Y10 from [DESC SRD](https://arxiv.org/abs/1809.01669).
+```
+sigma_pix = sigma_e / sqrt(2 * n_eff * A_pix)
+```
+
+where `sigma_e` is the per-component intrinsic ellipticity dispersion, `n_eff` is the effective galaxy number density (in sr⁻¹), and `A_pix = 4pi / N_pix` is the pixel solid angle. The factor of 2 accounts for two ellipticity components. Noise is Gaussian and independent per pixel.
+
+Shape noise is added to the full-sky nside=1024 convergence map **before** harmonic filtering, so the noise is band-limited consistently with the signal. For a given (sim_id, noise_level), the same noise realization is shared across all lmax cuts and orientations (the harmonic filter selects different scales from the same underlying noisy field). RNG seed: `sim_id * 1000 + noise_level_index`.
+
+#### DES Y3 ([Amon et al. 2022](https://arxiv.org/abs/2105.13543), Table 1)
+
+| Bin | n_eff (arcmin⁻²) | sigma_e |
+|-----|-------------------|---------|
+| 0   | 1.476             | 0.243   |
+| 1   | 1.479             | 0.262   |
+| 2   | 1.484             | 0.259   |
+| 3   | 1.461             | 0.301   |
+
+#### LSST Y10 ([DESC SRD](https://arxiv.org/abs/1809.01669))
+
+| Bin | n_eff (arcmin⁻²) | sigma_e |
+|-----|-------------------|---------|
+| 0–3 | 6.75              | 0.26    |
+
+Total n_eff = 27 arcmin⁻² split uniformly across 4 bins to match the DES tomographic structure.
 
 ### Running tile extraction (Stage 2)
 
@@ -175,7 +194,15 @@ modal run scripts/push_hf_dataset.py
 
 ### Spectra dataset
 
-For 2-point function analysis, flat-sky auto/cross power spectra (10 per tile) are pre-computed from the tiles using 2D FFT with azimuthal binning.
+For 2-point function analysis, flat-sky auto/cross power spectra are pre-computed from the tiles. Each tile produces 10 binned C_ell (4 auto + 6 cross-spectra for the 4 tomographic bins) in 20 linear ell bins from the fundamental mode to lmax.
+
+**Method.** 2D FFT on each flat tile, followed by azimuthal averaging in annular ell bins. Normalization: `C_ell = (pixel_size² / N²) * |FFT|²`, averaged over modes per bin.
+
+**Output.** One parquet file per (lmax, noise_level) configuration (15 total). Each row is one tile and contains:
+- `sim_id`, `orientation_id` (0–2), `tile_id` (0–3), `noise_level`
+- `ell_eff`: effective multipole at bin centers (length 20)
+- `cl_i_j`: binned power spectrum for bin pair (i, j) — 10 columns: `cl_0_0`, `cl_0_1`, `cl_0_2`, `cl_0_3`, `cl_1_1`, `cl_1_2`, `cl_1_3`, `cl_2_2`, `cl_2_3`, `cl_3_3`
+- Cosmological parameters: `Omega_m`, `sigma_8`, `S8`, `w`, `h`, `n_s`, `Omega_b`, `m_nu`
 
 ```bash
 # Build spectra for all (lmax, noise_level) configs
