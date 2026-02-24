@@ -37,7 +37,7 @@ SIM_URL = "http://star.ucl.ac.uk/GowerStreetSims/simulations/sim{sim_id:05d}.tar
     timeout=1800,
     memory=8192,
     retries=modal.Retries(max_retries=3, initial_delay=5.0, backoff_coefficient=2.0),
-    max_containers=50,
+    max_containers=100,
 )
 def process_simulation(sim_id: int) -> dict:
     import shutil
