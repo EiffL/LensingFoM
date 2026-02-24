@@ -10,4 +10,3 @@ lenstools @ git+https://github.com/EiffL/LensTools.git
 datasets
 torch
 lightning
-sbi

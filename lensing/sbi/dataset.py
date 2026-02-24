@@ -109,56 +109,75 @@ class SpectraDataset:
 class SpectraDataModule(L.LightningDataModule):
     """Lightning DataModule for spectra parquet files.
 
+    Clean 3-way split with no data leakage:
+    - Compressor train/val: 80/20 sub-split of the 60% train sims
+    - NPE: 20% sims (untouched until NPE training)
+    - Test: 20% sims (untouched until FoM evaluation)
+
     Parameters
     ----------
     parquet_path : str or Path
         Path to spectra_lmax{lmax}.parquet.
     batch_size : int
         Batch size for dataloaders.
+    compressor_val_frac : float
+        Fraction of train sims held out for compressor early stopping.
     """
 
-    def __init__(self, parquet_path, batch_size=256):
+    def __init__(self, parquet_path, batch_size=256, compressor_val_frac=0.2):
         super().__init__()
         self.parquet_path = parquet_path
         self.batch_size = batch_size
-        self.train_ds = None
-        self.val_ds = None
+        self.compressor_val_frac = compressor_val_frac
+        self.comp_train_ds = None
+        self.comp_val_ds = None
+        self.npe_ds = None
         self.test_ds = None
 
     def setup(self, stage=None):
         spectra, theta, sim_ids = load_spectra_parquet(self.parquet_path)
         train_mask, npe_mask, test_mask = split_by_sim_id(sim_ids)
 
-        # Compute normalization stats from train split only
-        spectra_mean = spectra[train_mask].mean(axis=0)
-        spectra_std = spectra[train_mask].std(axis=0)
-        spectra_std = np.where(spectra_std < 1e-30, 1.0, spectra_std)
+        # Sub-split train sims into compressor-train / compressor-val
+        train_sim_ids = np.unique(sim_ids[train_mask])
+        rng = np.random.default_rng(123)  # different seed from the main split
+        rng.shuffle(train_sim_ids)
+        n_comp_val = max(1, int(self.compressor_val_frac * len(train_sim_ids)))
+        comp_val_ids = set(train_sim_ids[:n_comp_val])
+        comp_train_mask = train_mask & np.array([s not in comp_val_ids for s in sim_ids])
+        comp_val_mask = train_mask & np.array([s in comp_val_ids for s in sim_ids])
 
-        theta_mean = theta[train_mask].mean(axis=0)
-        theta_std = theta[train_mask].std(axis=0)
-        theta_std = np.where(theta_std < 1e-30, 1.0, theta_std)
+        # Compute normalization stats from compressor-train split only
+        # Use relative threshold: clamp std to at least 1e-6 * |mean| to avoid
+        # zeroing out features with small but physically meaningful variance
+        spectra_mean = spectra[comp_train_mask].mean(axis=0)
+        spectra_std = spectra[comp_train_mask].std(axis=0)
+        min_std = np.maximum(np.abs(spectra_mean) * 1e-6, 1e-30)
+        spectra_std = np.maximum(spectra_std, min_std)
 
-        self.train_ds = SpectraDataset(
-            spectra[train_mask], theta[train_mask],
-            spectra_mean, spectra_std, theta_mean, theta_std,
+        theta_mean = theta[comp_train_mask].mean(axis=0)
+        theta_std = theta[comp_train_mask].std(axis=0)
+        theta_std = np.where(theta_std == 0, 1.0, theta_std)
+
+        norm = (spectra_mean, spectra_std, theta_mean, theta_std)
+
+        self.comp_train_ds = SpectraDataset(
+            spectra[comp_train_mask], theta[comp_train_mask], *norm,
         )
-        self.val_ds = SpectraDataset(
-            spectra[npe_mask], theta[npe_mask],
-            spectra_mean, spectra_std, theta_mean, theta_std,
+        self.comp_val_ds = SpectraDataset(
+            spectra[comp_val_mask], theta[comp_val_mask], *norm,
+        )
+        self.npe_ds = SpectraDataset(
+            spectra[npe_mask], theta[npe_mask], *norm,
         )
         self.test_ds = SpectraDataset(
-            spectra[test_mask], theta[test_mask],
-            spectra_mean, spectra_std, theta_mean, theta_std,
+            spectra[test_mask], theta[test_mask], *norm,
         )
 
     def train_dataloader(self):
-        x, y = self.train_ds.tensors()
+        x, y = self.comp_train_ds.tensors()
         return DataLoader(TensorDataset(x, y), batch_size=self.batch_size, shuffle=True)
 
     def val_dataloader(self):
-        x, y = self.val_ds.tensors()
-        return DataLoader(TensorDataset(x, y), batch_size=self.batch_size)
-
-    def test_dataloader(self):
-        x, y = self.test_ds.tensors()
+        x, y = self.comp_val_ds.tensors()
         return DataLoader(TensorDataset(x, y), batch_size=self.batch_size)

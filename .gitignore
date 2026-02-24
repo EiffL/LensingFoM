@@ -208,3 +208,8 @@ __marimo__/
 
 
 data
+
+# SBI pipeline artifacts
+results/sbi/lmax*/
+lightning_logs/
+results
