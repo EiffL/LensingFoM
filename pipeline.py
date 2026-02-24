@@ -30,6 +30,8 @@ NZ_PATH = "/pipeline/des_y3_2pt.fits"
 NSIDE_OUT = 1024
 SIM_URL = "http://star.ucl.ac.uk/GowerStreetSims/simulations/sim{sim_id:05d}.tar.gz"
 LMAX_VALUES = [200, 400, 600, 800, 1000]
+NOISE_LEVELS = ["noiseless", "des_y3", "lsst_y10"]
+NOISE_LEVEL_INDEX = {name: i for i, name in enumerate(NOISE_LEVELS)}
 
 
 @app.function(
@@ -127,8 +129,8 @@ def process_simulation(sim_id: int) -> dict:
 
 @app.function(
     volumes={RESULTS_DIR: vol},
-    timeout=1800,
-    memory=1024,
+    timeout=3600,
+    memory=2048,
 )
 def extract_tiles(sim_id: int) -> dict:
     import numpy as np
@@ -144,29 +146,53 @@ def extract_tiles(sim_id: int) -> dict:
         print(f"{sim_tag}: no kappa_maps.npz, skipping")
         return {"sim_id": sim_id, "status": "no_source"}
 
-    # Check if already done (all lmax files exist)
-    tile_paths = [sim_dir / f"tiles_lmax{lmax}.npz" for lmax in LMAX_VALUES]
-    if all(p.exists() for p in tile_paths):
-        print(f"{sim_tag}: tiles already exist, skipping")
+    # Check if already done (all lmax x noise_level files exist)
+    all_tile_paths = [
+        sim_dir / f"tiles_lmax{lmax}_noise_{nl}.npz"
+        for lmax in LMAX_VALUES
+        for nl in NOISE_LEVELS
+    ]
+    if all(p.exists() for p in all_tile_paths):
+        print(f"{sim_tag}: all tiles already exist, skipping")
         return {"sim_id": sim_id, "status": "skipped"}
 
     # Load full-sky kappa maps
     data = np.load(npz_path)
     kappa_maps = [data[f"kappa_bin{i}"] for i in range(4)]
 
-    for lmax in LMAX_VALUES:
-        tile_path = sim_dir / f"tiles_lmax{lmax}.npz"
-        if tile_path.exists():
-            continue
+    for noise_level in NOISE_LEVELS:
+        noise_idx = NOISE_LEVEL_INDEX[noise_level]
+        # Deterministic seed per (sim_id, noise_level)
+        rng = np.random.default_rng(sim_id * 1000 + noise_idx)
+        # Pre-generate one noise realization per bin (reused across lmax)
+        if noise_level != "noiseless":
+            from lensing.tiles import NOISE_CONFIGS, add_shape_noise
+            cfg = NOISE_CONFIGS[noise_level]
+            noisy_maps = [
+                add_shape_noise(
+                    kappa_maps[b],
+                    n_eff_arcmin2=cfg["n_eff_arcmin2"][b],
+                    sigma_e=cfg["sigma_e"][b],
+                    rng=rng,
+                )
+                for b in range(4)
+            ]
+        else:
+            noisy_maps = kappa_maps
 
-        nside_down = LMAX_TO_NSIDE[lmax]
-        # Shape: (12, 4, nside_down, nside_down)
-        all_tiles = np.stack(
-            [extract_tiles_for_lmax(kappa_maps[b], lmax) for b in range(4)],
-            axis=1,
-        )
-        np.savez_compressed(tile_path, tiles=all_tiles)
-        print(f"{sim_tag}: saved {tile_path.name} shape={all_tiles.shape}")
+        for lmax in LMAX_VALUES:
+            tile_path = sim_dir / f"tiles_lmax{lmax}_noise_{noise_level}.npz"
+            if tile_path.exists():
+                continue
+
+            nside_down = LMAX_TO_NSIDE[lmax]
+            # Shape: (12, 4, nside_down, nside_down)
+            all_tiles = np.stack(
+                [extract_tiles_for_lmax(noisy_maps[b], lmax) for b in range(4)],
+                axis=1,
+            )
+            np.savez_compressed(tile_path, tiles=all_tiles)
+            print(f"{sim_tag}: saved {tile_path.name} shape={all_tiles.shape}")
 
     vol.commit()
     return {"sim_id": sim_id, "status": "ok"}
