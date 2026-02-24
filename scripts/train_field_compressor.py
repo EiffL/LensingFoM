@@ -24,7 +24,7 @@ RESULTS_DIR = "/results"
 
 @app.function(
     volumes={RESULTS_DIR: vol},
-    gpu="A100",
+    gpu="A100-80GB",
     timeout=7200,
     memory=32768,
     secrets=[modal.Secret.from_name("wandb-secret")],
