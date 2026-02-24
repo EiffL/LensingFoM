@@ -1,7 +1,4 @@
-"""Train a simple L2 regressor on real power spectra from Gower Street simulations.
-
-Dead simple: MLP predicts theta from spectra with MSE loss.
-Tracks train vs val loss to check for overfitting.
+"""Train VMIM compressor on real power spectra from Gower Street simulations.
 
 Usage:
     modal run scripts/train_compressor.py
@@ -37,21 +34,22 @@ def train_and_evaluate(
     max_epochs: int = 1000,
     lr: float = 2e-4,
     hidden_dim: int = 256,
+    summary_dim: int = 2,
+    full_cov: bool = False,
     batch_size: int = 256,
 ):
-    """Train simple L2 regressor, log train/val loss to wandb."""
+    """Train VMIM compressor, log loss and FoM to wandb."""
     import json
     import time
     from pathlib import Path
 
     import lightning as L
     import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
     import wandb
     from lightning.pytorch.callbacks import ModelCheckpoint
     from lightning.pytorch.loggers import WandbLogger
 
+    from lensing.sbi.compressor import VMIMCompressor
     from lensing.sbi.dataset import SpectraDataModule
 
     t0 = time.time()
@@ -59,37 +57,6 @@ def train_and_evaluate(
     if torch.cuda.is_available():
         print(f"GPU: {torch.cuda.get_device_name(0)}")
         torch.set_float32_matmul_precision("high")
-
-    # --- Simple L2 regressor ---
-    class L2Regressor(L.LightningModule):
-        def __init__(self, input_dim, hidden_dim=256, theta_dim=2, lr=2e-4):
-            super().__init__()
-            self.save_hyperparameters()
-            self.net = nn.Sequential(
-                nn.Linear(input_dim, hidden_dim),
-                nn.GELU(),
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.GELU(),
-                nn.Linear(hidden_dim, theta_dim),
-            )
-
-        def forward(self, x):
-            return self.net(x)
-
-        def training_step(self, batch, _batch_idx):
-            x, theta = batch
-            loss = F.mse_loss(self(x), theta)
-            self.log("train_loss", loss, prog_bar=True)
-            return loss
-
-        def validation_step(self, batch, _batch_idx):
-            x, theta = batch
-            loss = F.mse_loss(self(x), theta)
-            self.log("val_loss", loss, prog_bar=True)
-            return loss
-
-        def configure_optimizers(self):
-            return torch.optim.AdamW(self.parameters(), lr=self.hparams.lr)
 
     # --- Load data ---
     parquet_path = Path(RESULTS_DIR) / "spectra_dataset" / f"spectra_lmax{lmax}_noise_{noise_level}.parquet"
@@ -111,19 +78,30 @@ def train_and_evaluate(
     print(f"Input dim: {input_dim}")
 
     # --- Build model ---
-    tag = f"l2_lmax{lmax}_{noise_level}"
+    tag = f"vmim_lmax{lmax}_{noise_level}"
+    if full_cov:
+        tag += "_fullcov"
     run_dir = Path(RESULTS_DIR) / "compressor_runs" / tag
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    model = L2Regressor(input_dim=input_dim, hidden_dim=hidden_dim, lr=lr)
+    model = VMIMCompressor(
+        input_dim=input_dim,
+        summary_dim=summary_dim,
+        theta_dim=2,
+        hidden_dim=hidden_dim,
+        full_cov=full_cov,
+        lr=lr,
+        weight_decay=1e-4,
+        theta_std=dm.train_ds.theta_std,
+    )
 
     wandb_logger = WandbLogger(
         project="LensingFoM", entity="eiffl", name=tag,
         config=dict(
             lmax=lmax, noise_level=noise_level, input_dim=input_dim,
             n_train=n_train, n_val=n_val, n_test=n_test,
-            hidden_dim=hidden_dim, lr=lr, batch_size=batch_size,
-            max_epochs=max_epochs, loss="l2",
+            summary_dim=summary_dim, hidden_dim=hidden_dim, full_cov=full_cov,
+            lr=lr, batch_size=batch_size, max_epochs=max_epochs,
         ),
         save_dir=str(run_dir),
     )
@@ -147,21 +125,29 @@ def train_and_evaluate(
     # --- Evaluate on test set ---
     best_path = ckpt_callback.best_model_path
     if best_path:
-        model = L2Regressor.load_from_checkpoint(best_path)
+        model = VMIMCompressor.load_from_checkpoint(
+            best_path, theta_std=dm.train_ds.theta_std, weights_only=False,
+        )
     model = model.cpu().eval()
 
     x_test, theta_test = dm.test_ds.tensors()
     with torch.no_grad():
-        test_loss = float(F.mse_loss(model(x_test), theta_test))
-    print(f"\nTest MSE: {test_loss:.6f}")
+        test_loss, test_foms = model._nll_and_fom(x_test, theta_test)
+    test_fom = float(test_foms.median())
+    print(f"\nTest loss: {float(test_loss):.4f}")
+    print(f"Test FoM:  {test_fom:.1f}")
 
-    wandb_logger.experiment.summary["test/mse"] = test_loss
+    wandb_logger.experiment.summary.update({
+        "test/loss": float(test_loss),
+        "test/fom": test_fom,
+    })
 
     result = dict(
         lmax=lmax, noise_level=noise_level, input_dim=input_dim,
         n_train=n_train, n_val=n_val, n_test=n_test,
-        hidden_dim=hidden_dim, lr=lr, batch_size=batch_size,
-        test_mse=test_loss,
+        summary_dim=summary_dim, hidden_dim=hidden_dim, full_cov=full_cov,
+        lr=lr, batch_size=batch_size,
+        test_loss=float(test_loss), test_fom=test_fom,
         epochs_trained=trainer.current_epoch,
         elapsed_s=time.time() - t0,
     )
@@ -182,12 +168,15 @@ def main(
     max_epochs: int = 1000,
     lr: float = 2e-4,
     hidden_dim: int = 256,
+    summary_dim: int = 2,
+    full_cov: bool = False,
     batch_size: int = 256,
 ):
     result = train_and_evaluate.remote(
         lmax=lmax, noise_level=noise_level,
         max_epochs=max_epochs, lr=lr, hidden_dim=hidden_dim,
+        summary_dim=summary_dim, full_cov=full_cov,
         batch_size=batch_size,
     )
-    print(f"\nTest MSE: {result['test_mse']:.6f}")
+    print(f"\nTest FoM: {result['test_fom']:.1f}")
     print(f"Trained {result['epochs_trained']} epochs in {result['elapsed_s']:.0f}s")
