@@ -24,47 +24,47 @@ bash scripts/download_data.sh    # Downloads ~3 GB of simulation data
 jupyter notebook notebooks/01_validate_raytracing.ipynb
 ```
 
-### Processing all 791 simulations with Modal
+### Modal pipeline
 
-The `pipeline.py` script runs the Born raytracing pipeline on all 791 Gower Street simulations in parallel using [Modal](https://modal.com). Each simulation is processed in its own container: download the tarball, extract, raytrace at nside=1024, and save the 4 tomographic convergence maps to a persistent Modal Volume.
+The full pipeline runs on [Modal](https://modal.com) in 5 stages. All stages are idempotent — completed work is skipped on re-run.
+
+| Stage | Name | What it does |
+|-------|------|-------------|
+| 1 | Born raytracing | Download sims, raytrace, save convergence maps |
+| 2 | Tile extraction | Harmonic filter + noise + rotation → flat tiles |
+| 3 | Build HF dataset | Convert tiles to parquet shards |
+| 4 | Push HF dataset | Upload parquet shards to HuggingFace Hub |
+| 5 | Build spectra | Compute auto/cross power spectra from tiles |
 
 #### Prerequisites
-
-1. Install Modal and authenticate:
 
 ```bash
 pip install modal
 modal setup   # opens browser to log in
 ```
 
-2. That's it. All dependencies (healpy, CAMB, astropy, etc.) are installed inside the Modal image automatically. The DES Y3 n(z) FITS file is downloaded at image build time so it's shared across all containers.
+All dependencies are installed inside the Modal image automatically. Stage 4 requires a Modal secret: `modal secret create huggingface-secret HF_TOKEN=hf_xxx`.
 
-#### Run a single simulation (test)
-
-```bash
-modal run pipeline.py --sim-id 1
-```
-
-This takes ~10 minutes and is a good sanity check before launching the full run. Inspect the output on the volume:
+#### Run the full pipeline
 
 ```bash
-modal volume ls lensing-results sim00001/
+modal run pipeline.py --stage all
 ```
 
-#### Run all 791 simulations
+This runs stages 1→2→3→4→5 sequentially. Each stage prints a summary when done. Safe to re-run at any time.
+
+#### Run individual stages
 
 ```bash
-modal run pipeline.py
-```
+modal run pipeline.py --stage 1   # Born raytracing only
+modal run pipeline.py --stage 2   # Tile extraction only
+modal run pipeline.py --stage 3   # Build HF parquet shards
+modal run pipeline.py --stage 4   # Push to HuggingFace Hub
+modal run pipeline.py --stage 5   # Build power spectra
 
-This processes all simulations in parallel (up to 20 concurrent containers, to avoid overwhelming the UCL download server). Each simulation takes ~10 minutes, so the full run completes in ~7 hours. The run is idempotent — simulations that already have output on the volume are skipped, so you can safely re-run after failures.
-
-At the end, a summary is printed:
-
-```
-785 succeeded, 6 failed
-  sim00123: <error message>
-  ...
+# Single simulation (stages 1-2 only)
+modal run pipeline.py --stage 1 --sim-id 1
+modal run pipeline.py --stage 2 --sim-id 1
 ```
 
 #### Output format
@@ -152,16 +152,6 @@ Shape noise is added to the full-sky nside=1024 convergence map **before** harmo
 
 Total n_eff = 27 arcmin⁻² split uniformly across 4 bins to match the DES tomographic structure.
 
-### Running tile extraction (Stage 2)
-
-```bash
-# Single simulation
-modal run pipeline.py --stage 2 --sim-id 1
-
-# All simulations (generates 15 tile files per sim: 5 lmax x 3 noise levels)
-modal run pipeline.py --stage 2
-```
-
 ### HuggingFace Dataset
 
 The extracted tiles are published as a HuggingFace dataset at [`EiffL/GowerStreetDESY3`](https://huggingface.co/datasets/EiffL/GowerStreetDESY3).
@@ -179,22 +169,11 @@ noise = sample["noise_level"]     # "des_y3"
 
 Each sample includes the convergence map tile (4 tomographic bins), noise level, and all cosmological parameters (Omega_m, sigma_8, S8, w, h, n_s, Omega_b, m_nu). Components are named `lmax_{lmax}_{noise_level}` (15 total = 5 lmax x 3 noise levels).
 
-#### Building and pushing the dataset
-
-```bash
-# Build parquet shards on Modal volume (all 15 configs)
-modal run scripts/build_hf_dataset.py
-
-# Build specific config
-modal run scripts/build_hf_dataset.py --lmax 600 --noise-level des_y3
-
-# Push to HuggingFace Hub (requires huggingface-secret on Modal)
-modal run scripts/push_hf_dataset.py
-```
+Built by Stage 3 (`modal run pipeline.py --stage 3`), pushed by Stage 4 (`modal run pipeline.py --stage 4`).
 
 ### Spectra dataset
 
-For 2-point function analysis, flat-sky auto/cross power spectra are pre-computed from the tiles. Each tile produces 10 binned C_ell (4 auto + 6 cross-spectra for the 4 tomographic bins) in 20 linear ell bins from the fundamental mode to lmax.
+For 2-point function analysis, flat-sky auto/cross power spectra are pre-computed from the tiles (Stage 5). Each tile produces 10 binned C_ell (4 auto + 6 cross-spectra for the 4 tomographic bins) in 20 linear ell bins from the fundamental mode to lmax.
 
 **Method.** 2D FFT on each flat tile, followed by azimuthal averaging in annular ell bins. Normalization: `C_ell = (pixel_size² / N²) * |FFT|²`, averaged over modes per bin.
 
@@ -203,11 +182,3 @@ For 2-point function analysis, flat-sky auto/cross power spectra are pre-compute
 - `ell_eff`: effective multipole at bin centers (length 20)
 - `cl_i_j`: binned power spectrum for bin pair (i, j) — 10 columns: `cl_0_0`, `cl_0_1`, `cl_0_2`, `cl_0_3`, `cl_1_1`, `cl_1_2`, `cl_1_3`, `cl_2_2`, `cl_2_3`, `cl_3_3`
 - Cosmological parameters: `Omega_m`, `sigma_8`, `S8`, `w`, `h`, `n_s`, `Omega_b`, `m_nu`
-
-```bash
-# Build spectra for all (lmax, noise_level) configs
-modal run scripts/build_spectra_dataset.py
-
-# Single config
-modal run scripts/build_spectra_dataset.py --lmax 600 --noise-level des_y3
-```

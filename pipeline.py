@@ -1,15 +1,35 @@
-"""Modal pipeline — Stage 1: Generate convergence maps; Stage 2: Extract filtered tiles."""
+"""Modal pipeline for LensingFoM.
 
+Stage 1: Born raytracing — download sims, raytrace, save convergence maps
+Stage 2: Tile extraction — harmonic filter + noise + rotation → flat tiles
+Stage 3: Build HF dataset — convert tiles to parquet shards
+Stage 4: Push HF dataset — upload parquet shards to HuggingFace Hub
+Stage 5: Build spectra — compute auto/cross power spectra from tiles
+
+Usage:
+    modal run pipeline.py --stage 1          # single stage
+    modal run pipeline.py --stage 2 --sim-id 1  # single sim
+    modal run pipeline.py --stage all        # run all stages sequentially
+"""
+
+import csv
 import json
 import tarfile
 from pathlib import Path
 
 import modal
 
+# ---------------------------------------------------------------------------
+# Modal app & image
+# ---------------------------------------------------------------------------
+
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .apt_install("libcfitsio-dev", "pkg-config")
-    .pip_install("numpy", "scipy", "healpy", "camb", "astropy", "httpx")
+    .pip_install(
+        "numpy", "scipy", "healpy", "camb", "astropy", "httpx",
+        "pyarrow", "datasets", "huggingface_hub",
+    )
     .run_commands(
         "mkdir -p /pipeline && python -c \""
         "import httpx; "
@@ -30,8 +50,42 @@ NZ_PATH = "/pipeline/des_y3_2pt.fits"
 NSIDE_OUT = 1024
 SIM_URL = "http://star.ucl.ac.uk/GowerStreetSims/simulations/sim{sim_id:05d}.tar.gz"
 LMAX_VALUES = [200, 400, 600, 800, 1000]
+LMAX_TO_NSIDE = {200: 128, 400: 256, 600: 256, 800: 512, 1000: 512}
 NOISE_LEVELS = ["noiseless", "des_y3", "lsst_y10"]
 NOISE_LEVEL_INDEX = {name: i for i, name in enumerate(NOISE_LEVELS)}
+N_TILES = 12  # 3 orientations x 4 equatorial tiles
+SIMS_PER_SHARD = 50
+N_BINS = 20
+
+
+def load_cosmo_params(csv_path):
+    """Load all cosmological parameters from gower_street_runs.csv."""
+    params = {}
+    with open(csv_path) as f:
+        reader = csv.reader(f)
+        next(reader)  # category row
+        next(reader)  # column names
+        for row in reader:
+            sim_id = int(row[0])
+            omega_m = float(row[3])
+            sigma_8 = float(row[4])
+            params[sim_id] = {
+                "Omega_m": omega_m,
+                "sigma_8": sigma_8,
+                "S8": sigma_8 * (omega_m / 0.3) ** 0.5,
+                "w": float(row[5]),
+                "Omega_bh2": float(row[6]),
+                "h": float(row[7]),
+                "n_s": float(row[8]),
+                "m_nu": float(row[9]),
+                "Omega_b": float(row[10]),
+            }
+    return params
+
+
+# ---------------------------------------------------------------------------
+# Stage 1: Born raytracing
+# ---------------------------------------------------------------------------
 
 
 @app.function(
@@ -127,6 +181,11 @@ def process_simulation(sim_id: int) -> dict:
     return {"sim_id": sim_id, "status": "ok"}
 
 
+# ---------------------------------------------------------------------------
+# Stage 2: Tile extraction with noise
+# ---------------------------------------------------------------------------
+
+
 @app.function(
     volumes={RESULTS_DIR: vol},
     timeout=3600,
@@ -198,37 +257,294 @@ def extract_tiles(sim_id: int) -> dict:
     return {"sim_id": sim_id, "status": "ok"}
 
 
+# ---------------------------------------------------------------------------
+# Stage 3: Build HuggingFace parquet shards
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    volumes={RESULTS_DIR: vol},
+    timeout=3600,
+    memory=8192,
+)
+def build_parquet_for_config(lmax: int, noise_level: str) -> dict:
+    """Build parquet shards for one (lmax, noise_level) combination."""
+    import numpy as np
+    from datasets import Dataset
+
+    cosmo_params = load_cosmo_params(CSV_PATH)
+    nside = LMAX_TO_NSIDE[lmax]
+
+    out_dir = Path(RESULTS_DIR) / "hf_dataset" / f"lmax_{lmax}_{noise_level}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    total_tiles = 0
+    shard_idx = 0
+    skipped = 0
+
+    for shard_start in range(1, 792, SIMS_PER_SHARD):
+        shard_end = min(shard_start + SIMS_PER_SHARD, 792)
+        records = []
+
+        for sim_id in range(shard_start, shard_end):
+            sim_tag = f"sim{sim_id:05d}"
+            npz_path = Path(RESULTS_DIR) / sim_tag / f"tiles_lmax{lmax}_noise_{noise_level}.npz"
+
+            if not npz_path.exists():
+                skipped += 1
+                continue
+
+            if sim_id not in cosmo_params:
+                skipped += 1
+                continue
+
+            data = np.load(npz_path)
+            tiles = data["tiles"]  # shape (12, 4, nside, nside)
+            cp = cosmo_params[sim_id]
+
+            for tile_idx in range(N_TILES):
+                records.append({
+                    "kappa": tiles[tile_idx].tolist(),  # (4, nside, nside)
+                    "sim_id": sim_id,
+                    "orientation_id": tile_idx // 4,
+                    "tile_id": tile_idx % 4,
+                    "noise_level": noise_level,
+                    "Omega_m": cp["Omega_m"],
+                    "sigma_8": cp["sigma_8"],
+                    "S8": cp["S8"],
+                    "w": cp["w"],
+                    "h": cp["h"],
+                    "n_s": cp["n_s"],
+                    "Omega_b": cp["Omega_b"],
+                    "m_nu": cp["m_nu"],
+                })
+
+        if records:
+            shard_path = out_dir / f"shard_{shard_idx:04d}.parquet"
+            ds = Dataset.from_list(records)
+            ds.to_parquet(str(shard_path))
+            total_tiles += len(records)
+            print(f"lmax={lmax}/{noise_level}: wrote {shard_path.name} ({len(records)} tiles, sims {shard_start}-{shard_end - 1})")
+            del records, ds
+        shard_idx += 1
+
+    vol.commit()
+    print(f"lmax={lmax}/{noise_level}: done — {total_tiles} tiles in {shard_idx} shards, {skipped} sims skipped")
+    return {"lmax": lmax, "noise_level": noise_level, "total_tiles": total_tiles, "shards": shard_idx, "skipped": skipped}
+
+
+# ---------------------------------------------------------------------------
+# Stage 4: Push HuggingFace dataset to Hub
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    volumes={RESULTS_DIR: vol},
+    timeout=3600,
+    memory=4096,
+    secrets=[modal.Secret.from_name("huggingface-secret")],
+)
+def push_to_hub(
+    repo_id: str = "EiffL/GowerStreetDESY3",
+    lmax_filter: int = None,
+    noise_filter: str = None,
+) -> dict:
+    """Push parquet shards to HuggingFace Hub."""
+    import os
+    from huggingface_hub import HfApi
+
+    token = os.environ["HF_TOKEN"]
+    api = HfApi(token=token)
+    api.create_repo(repo_id, repo_type="dataset", exist_ok=True)
+
+    hf_dir = Path(RESULTS_DIR) / "hf_dataset"
+    lmax_list = [lmax_filter] if lmax_filter else LMAX_VALUES
+    noise_list = [noise_filter] if noise_filter else NOISE_LEVELS
+    pushed = {}
+
+    for lmax in lmax_list:
+        for noise_level in noise_list:
+            config_name = f"lmax_{lmax}_{noise_level}"
+            config_dir = hf_dir / config_name
+            if not config_dir.exists():
+                print(f"{config_name}: no parquet shards found, skipping")
+                continue
+
+            parquet_files = sorted(config_dir.glob("shard_*.parquet"))
+            if not parquet_files:
+                print(f"{config_name}: no parquet files, skipping")
+                continue
+
+            for pf in parquet_files:
+                api.upload_file(
+                    path_or_fileobj=str(pf),
+                    path_in_repo=f"data/{config_name}/{pf.name}",
+                    repo_id=repo_id,
+                    repo_type="dataset",
+                )
+                print(f"{config_name}: uploaded {pf.name}")
+
+            pushed[config_name] = len(parquet_files)
+            print(f"{config_name}: pushed {len(parquet_files)} shards")
+
+    return {"repo_id": repo_id, "pushed": pushed}
+
+
+# ---------------------------------------------------------------------------
+# Stage 5: Build power spectra dataset
+# ---------------------------------------------------------------------------
+
+
+@app.function(
+    volumes={RESULTS_DIR: vol},
+    timeout=3600,
+    memory=4096,
+)
+def build_spectra_for_config(lmax: int, noise_level: str) -> dict:
+    """Compute power spectra for all tiles at one (lmax, noise_level), save as parquet."""
+    import numpy as np
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from lensing.spectra import SPEC_PAIRS, compute_all_spectra
+
+    cosmo_params = load_cosmo_params(CSV_PATH)
+    nside = LMAX_TO_NSIDE[lmax]
+
+    out_dir = Path(RESULTS_DIR) / "spectra_dataset"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"spectra_lmax{lmax}_noise_{noise_level}.parquet"
+
+    records = []
+    skipped = 0
+
+    for sim_id in range(1, 792):
+        sim_tag = f"sim{sim_id:05d}"
+        npz_path = Path(RESULTS_DIR) / sim_tag / f"tiles_lmax{lmax}_noise_{noise_level}.npz"
+
+        if not npz_path.exists():
+            skipped += 1
+            continue
+        if sim_id not in cosmo_params:
+            skipped += 1
+            continue
+
+        tiles = np.load(npz_path)["tiles"]  # (12, 4, nside, nside)
+        cp = cosmo_params[sim_id]
+
+        for tile_idx in range(N_TILES):
+            ell_eff, spectra = compute_all_spectra(
+                tiles[tile_idx], nside, lmax, n_bins=N_BINS
+            )
+
+            record = {
+                "sim_id": sim_id,
+                "orientation_id": tile_idx // 4,
+                "tile_id": tile_idx % 4,
+                "noise_level": noise_level,
+                "ell_eff": ell_eff.tolist(),
+                "Omega_m": cp["Omega_m"],
+                "sigma_8": cp["sigma_8"],
+                "S8": cp["S8"],
+                "w": cp["w"],
+                "h": cp["h"],
+                "n_s": cp["n_s"],
+                "Omega_b": cp["Omega_b"],
+                "m_nu": cp["m_nu"],
+            }
+            for s, (i, j) in enumerate(SPEC_PAIRS):
+                record[f"cl_{i}_{j}"] = spectra[s].tolist()
+
+            records.append(record)
+
+        if sim_id % 50 == 0:
+            print(f"lmax={lmax}/{noise_level}: processed {sim_id}/791 sims ({len(records)} tiles)")
+
+    # Write parquet
+    table = pa.Table.from_pylist(records)
+    pq.write_table(table, str(out_path))
+    vol.commit()
+
+    print(
+        f"lmax={lmax}/{noise_level}: wrote {out_path.name} — "
+        f"{len(records)} tiles, {skipped} sims skipped"
+    )
+    return {"lmax": lmax, "noise_level": noise_level, "total_tiles": len(records), "skipped": skipped}
+
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
+
+STAGE_NAMES = {
+    1: "Born raytracing",
+    2: "Tile extraction",
+    3: "Build HF dataset",
+    4: "Push HF dataset",
+    5: "Build spectra",
+}
+
+
+def _run_map_stage(stage_num, func, sim_ids):
+    """Run a per-sim .map() stage and print summary."""
+    results = list(func.map(sim_ids, return_exceptions=True))
+    successes = [r for r in results if not isinstance(r, Exception)]
+    failures = [
+        (sim_ids[i], r)
+        for i, r in enumerate(results)
+        if isinstance(r, Exception)
+    ]
+    print(f"Stage {stage_num} ({STAGE_NAMES[stage_num]}): {len(successes)} succeeded, {len(failures)} failed")
+    for sid, err in failures:
+        print(f"  sim{sid:05d}: {err}")
+    return len(failures) == 0
+
+
+def _run_starmap_stage(stage_num, func, configs):
+    """Run a per-config .starmap() stage and print summary."""
+    results = list(func.starmap(configs))
+    for r in results:
+        print(r)
+    print(f"Stage {stage_num} ({STAGE_NAMES[stage_num]}): {len(configs)} configs processed")
+    return True
+
+
+def _run_stage(stage_num, sim_id=None):
+    """Dispatch a single stage."""
+    sim_ids = list(range(1, 792))
+    configs = [(l, n) for l in LMAX_VALUES for n in NOISE_LEVELS]
+
+    if stage_num == 1:
+        if sim_id is not None:
+            print(process_simulation.remote(sim_id))
+        else:
+            _run_map_stage(1, process_simulation, sim_ids)
+
+    elif stage_num == 2:
+        if sim_id is not None:
+            print(extract_tiles.remote(sim_id))
+        else:
+            _run_map_stage(2, extract_tiles, sim_ids)
+
+    elif stage_num == 3:
+        _run_starmap_stage(3, build_parquet_for_config, configs)
+
+    elif stage_num == 4:
+        result = push_to_hub.remote()
+        print(result)
+        print(f"Stage 4 ({STAGE_NAMES[4]}): done")
+
+    elif stage_num == 5:
+        _run_starmap_stage(5, build_spectra_for_config, configs)
+
+
 @app.local_entrypoint()
-def main(sim_id: int = None, stage: int = 1):
-    if stage == 1:
-        if sim_id is not None:
-            result = process_simulation.remote(sim_id)
-            print(result)
-        else:
-            sim_ids = list(range(1, 792))
-            results = list(process_simulation.map(sim_ids, return_exceptions=True))
-            successes = [r for r in results if not isinstance(r, Exception)]
-            failures = [
-                (sim_ids[i], r)
-                for i, r in enumerate(results)
-                if isinstance(r, Exception)
-            ]
-            print(f"{len(successes)} succeeded, {len(failures)} failed")
-            for sid, err in failures:
-                print(f"  sim{sid:05d}: {err}")
-    elif stage == 2:
-        if sim_id is not None:
-            result = extract_tiles.remote(sim_id)
-            print(result)
-        else:
-            sim_ids = list(range(1, 792))
-            results = list(extract_tiles.map(sim_ids, return_exceptions=True))
-            successes = [r for r in results if not isinstance(r, Exception)]
-            failures = [
-                (sim_ids[i], r)
-                for i, r in enumerate(results)
-                if isinstance(r, Exception)
-            ]
-            print(f"Stage 2: {len(successes)} succeeded, {len(failures)} failed")
-            for sid, err in failures:
-                print(f"  sim{sid:05d}: {err}")
+def main(sim_id: int = None, stage: str = "1"):
+    if stage == "all":
+        for s in [1, 2, 3, 4, 5]:
+            print(f"\n{'='*60}")
+            print(f"Starting stage {s}: {STAGE_NAMES[s]}")
+            print(f"{'='*60}\n")
+            _run_stage(s, sim_id=sim_id if s <= 2 else None)
+    else:
+        _run_stage(int(stage), sim_id=sim_id)

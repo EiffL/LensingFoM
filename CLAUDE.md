@@ -28,12 +28,9 @@
   - `validation.py` — Power spectrum measurement and comparison plots
   - `tiles.py` — Tile extraction from HEALPix maps with harmonic filtering, rotation, and shape noise injection
   - `spectra.py` — Flat-sky FFT power spectrum estimation from projected tiles
-- `pipeline.py` — Modal pipeline: Stage 1 (Born raytracing), Stage 2 (tile extraction)
+- `pipeline.py` — Modal pipeline with 5 stages: (1) Born raytracing, (2) tile extraction, (3) build HF parquet, (4) push to HF Hub, (5) build spectra
 - `scripts/`
   - `download_data.sh` — Download Gower Street sim00001 + DES Y3 FITS
-  - `build_hf_dataset.py` — Build parquet shards from tiles on Modal volume
-  - `build_spectra_dataset.py` — Compute flat-sky auto/cross power spectra from tiles, save as parquet
-  - `push_hf_dataset.py` — Push parquet shards to HuggingFace Hub
   - `healpix_to_tiles.py` — Standalone tile extraction demo
   - `lmax_filtering_demo.py` — Harmonic filtering demo
 - `notebooks/01_validate_raytracing.ipynb` — End-to-end validation
@@ -67,29 +64,19 @@ jupyter notebook notebooks/01_validate_raytracing.ipynb
 ### Modal pipeline
 
 ```bash
-# Stage 1: Born raytracing (all 791 sims)
-modal run pipeline.py
+# Run full pipeline (all 5 stages sequentially, idempotent)
+modal run pipeline.py --stage all
 
-# Stage 2: Tile extraction with noise levels (all sims, 3 noise x 5 lmax)
-modal run pipeline.py --stage 2
+# Individual stages
+modal run pipeline.py --stage 1   # Born raytracing
+modal run pipeline.py --stage 2   # Tile extraction (3 noise x 5 lmax)
+modal run pipeline.py --stage 3   # Build HF parquet shards
+modal run pipeline.py --stage 4   # Push to HuggingFace Hub
+modal run pipeline.py --stage 5   # Build power spectra dataset
 
-# Build HuggingFace dataset (all 15 configs)
-modal run scripts/build_hf_dataset.py
-
-# Build for specific config
-modal run scripts/build_hf_dataset.py --lmax 200 --noise-level des_y3
-
-# Push to HuggingFace Hub
-modal run scripts/push_hf_dataset.py
-
-# Push specific config
-modal run scripts/push_hf_dataset.py --lmax 200 --noise-level des_y3
-
-# Build spectra dataset (all 15 configs)
-modal run scripts/build_spectra_dataset.py
-
-# Build spectra for specific config
-modal run scripts/build_spectra_dataset.py --lmax 600 --noise-level des_y3
+# Single simulation (stages 1-2 only)
+modal run pipeline.py --stage 1 --sim-id 1
+modal run pipeline.py --stage 2 --sim-id 1
 ```
 
 ## Data Sources

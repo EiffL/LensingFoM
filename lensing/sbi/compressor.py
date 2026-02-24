@@ -1,12 +1,5 @@
-"""VMIM compressor: MLP that compresses spectra to low-dim summaries.
+"""VMIM compressor: MLP that compresses spectra to low-dim summaries."""
 
-Two versions:
-- VMIMCompressor: Original diagonal-Gaussian VMIM head.
-- VMIMCompressorV2: Improved with LayerNorm, configurable architecture,
-  and optional full-covariance (Cholesky) VMIM head with FoM logging.
-"""
-
-import numpy as np
 import torch
 import torch.nn as nn
 
@@ -14,126 +7,11 @@ import lightning as L
 
 
 class VMIMCompressor(L.LightningModule):
-    """Variational Mutual Information Maximization compressor (original).
+    """Variational Mutual Information Maximization compressor.
 
-    Compresses spectra into 2-dim summary statistics by maximizing mutual
-    information with cosmological parameters via a diagonal Gaussian NLL loss.
-    """
-
-    def __init__(
-        self,
-        input_dim=200,
-        summary_dim=2,
-        lr=1e-3,
-        weight_decay=1e-5,
-        warmup_steps=100,
-        total_steps=5000,
-    ):
-        super().__init__()
-        self.save_hyperparameters()
-
-        self.compressor = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(128, 64),
-            nn.GELU(),
-            nn.Dropout(0.1),
-            nn.Linear(64, summary_dim),
-        )
-
-        self.vmim_head = nn.Sequential(
-            nn.Linear(summary_dim, 64),
-            nn.GELU(),
-            nn.Linear(64, summary_dim * 2),
-        )
-
-    def forward(self, x):
-        return self.compressor(x)
-
-    def _gaussian_nll(self, x, theta):
-        t = self.compressor(x)
-        out = self.vmim_head(t)
-        d = self.hparams.summary_dim
-        mu = out[:, :d]
-        log_sigma = out[:, d:]
-        nll = log_sigma + 0.5 * ((theta - mu) / (log_sigma.exp() + 1e-6)) ** 2
-        return nll.mean()
-
-    def training_step(self, batch, batch_idx):
-        x, theta = batch
-        loss = self._gaussian_nll(x, theta)
-        self.log("train_loss", loss, prog_bar=True)
-        return loss
-
-    def validation_step(self, batch, batch_idx):
-        x, theta = batch
-        loss = self._gaussian_nll(x, theta)
-        self.log("val_loss", loss, prog_bar=True)
-        return loss
-
-    def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(
-            self.parameters(),
-            lr=self.hparams.lr,
-            weight_decay=self.hparams.weight_decay,
-        )
-
-        def lr_lambda(step):
-            if step < self.hparams.warmup_steps:
-                return step / max(1, self.hparams.warmup_steps)
-            progress = (step - self.hparams.warmup_steps) / max(
-                1, self.hparams.total_steps - self.hparams.warmup_steps
-            )
-            return 0.5 * (1 + np.cos(np.pi * progress))
-
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
-        }
-
-    @torch.no_grad()
-    def compress(self, dataset):
-        """Compress a full SpectraDataset, returning numpy arrays."""
-        self.eval()
-        x = torch.tensor(dataset.spectra, dtype=torch.float32, device=self.device)
-        summaries = self.compressor(x).cpu().numpy()
-        return summaries, dataset.theta_raw
-
-
-class VMIMCompressorV2(L.LightningModule):
-    """Improved VMIM compressor with LayerNorm and optional full-covariance head.
-
-    Changes from V1:
-    - Wider network (hidden_dim → 128 → 64 → summary_dim) with LayerNorm
-    - Optional full-covariance VMIM head (Cholesky-parameterized)
-    - FoM computed and logged at each step
-    - Configurable summary_dim, hidden_dim, theta_dim
-
-    Parameters
-    ----------
-    input_dim : int
-        Dimension of input spectra.
-    summary_dim : int
-        Dimension of compressed summaries.
-    theta_dim : int
-        Dimension of parameter space (default 2 for Omega_m, S8).
-    hidden_dim : int
-        Width of first hidden layer.
-    full_cov : bool
-        If True, use Cholesky-parameterized full covariance in VMIM head.
-        If False, use diagonal covariance (log_sigma).
-    lr : float
-        Learning rate for AdamW.
-    weight_decay : float
-        Weight decay for AdamW.
-    warmup_steps : int
-        Number of linear warmup steps.
-    total_steps : int
-        Total training steps for cosine annealing.
-    theta_std : array-like, optional
-        Standard deviation of theta used for un-normalizing FoM.
+    Compresses spectra into low-dim summaries by maximizing mutual
+    information with cosmological parameters. Supports diagonal or
+    full-covariance (Cholesky) Gaussian VMIM head with FoM logging.
     """
 
     def __init__(
@@ -144,11 +22,7 @@ class VMIMCompressorV2(L.LightningModule):
         hidden_dim=256,
         full_cov=False,
         lr=5e-4,
-        min_lr=1e-4,
         weight_decay=1e-4,
-        warmup_steps=200,
-        plateau_patience=10,
-        plateau_factor=0.5,
         theta_std=None,
     ):
         super().__init__()
@@ -211,15 +85,14 @@ class VMIMCompressorV2(L.LightningModule):
             for i in range(d):
                 for j in range(i + 1):
                     if i == j:
-                        L[:, i, j] = nn.functional.softplus(chol_raw[:, idx]) + 1e-6
+                        L[:, i, j] = nn.functional.softplus(chol_raw[:, idx]) + 1e-4
                     else:
                         L[:, i, j] = chol_raw[:, idx]
                     idx += 1
             return mu, L
         else:
             mu = out[:, :d]
-            log_sigma = out[:, d:]
-            sigma = log_sigma.exp() + 1e-6
+            sigma = nn.functional.softplus(out[:, d:]) + 1e-4
             return mu, sigma
 
     def _nll_and_fom(self, x, theta):
@@ -240,8 +113,7 @@ class VMIMCompressorV2(L.LightningModule):
             fom_norm = 1.0 / L.diagonal(dim1=-2, dim2=-1).prod(-1)
         else:
             sigma = L_or_sigma
-            log_sigma = (sigma - 1e-6).clamp(min=1e-30).log()
-            nll = log_sigma + 0.5 * ((theta - mu) / sigma) ** 2
+            nll = sigma.log() + 0.5 * ((theta - mu) / sigma) ** 2
             loss = nll.mean()
             fom_norm = 1.0 / sigma.prod(dim=-1)
 
@@ -258,10 +130,6 @@ class VMIMCompressorV2(L.LightningModule):
         loss, fom = self._nll_and_fom(x, theta)
         self.log("train_loss", loss, prog_bar=True)
         self.log("train_fom_median", fom.median(), prog_bar=False)
-        # Log current LR for schedule tracking
-        opt = self.optimizers()
-        if hasattr(opt, "param_groups"):
-            self.log("lr", opt.param_groups[0]["lr"], prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
@@ -272,43 +140,10 @@ class VMIMCompressorV2(L.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(
+        return torch.optim.AdamW(
             self.parameters(),
             lr=self.hparams.lr,
             weight_decay=self.hparams.weight_decay,
-        )
-
-        # Linear warmup via LambdaLR that saturates at 1.0 after warmup_steps,
-        # combined with ReduceLROnPlateau for adaptive decay.
-        # We use LambdaLR for warmup at step level, then let
-        # ReduceLROnPlateau handle the rest at epoch level.
-        #
-        # Strategy: warmup is fast (a few hundred steps), so we run it as a
-        # step-level scheduler. Once warmup is done (lr_lambda=1.0), the
-        # plateau scheduler takes over by monitoring val_loss each epoch.
-        self._warmup_done = False
-
-        def warmup_lambda(step):
-            if step < self.hparams.warmup_steps:
-                return step / max(1, self.hparams.warmup_steps)
-            return 1.0
-
-        warmup_sched = torch.optim.lr_scheduler.LambdaLR(optimizer, warmup_lambda)
-
-        plateau_sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode="max",
-            factor=self.hparams.plateau_factor,
-            patience=self.hparams.plateau_patience,
-            min_lr=self.hparams.min_lr,
-        )
-
-        return (
-            [optimizer],
-            [
-                {"scheduler": warmup_sched, "interval": "step"},
-                {"scheduler": plateau_sched, "interval": "epoch", "monitor": "val_fom_median"},
-            ],
         )
 
     @torch.no_grad()

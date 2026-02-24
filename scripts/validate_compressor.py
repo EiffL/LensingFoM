@@ -32,9 +32,9 @@ image = (
     .add_local_python_source("lensing")
 )
 
-# Pre-computed Fisher FoM values (from jax-cosmo, f_sky=1/12).
-# These only depend on lmax and the DES Y3 n(z), so no need to recompute.
-FISHER_FOM = {200: 3832, 400: 7217, 600: 9949, 800: 11969, 1000: 13715}
+# Pre-computed Fisher FoM values (from CAMB finite differences, f_sky=1/12,
+# DES Y3 MagLim n(z), 20 linear ell bins). Includes DES Y3 shape noise.
+FISHER_FOM = {200: 3742, 400: 6627, 600: 8897, 800: 10786, 1000: 12234}
 
 app = modal.App("lensing-validate", image=image)
 vol = modal.Volume.from_name("lensing-results", create_if_missing=True)
@@ -53,13 +53,13 @@ def train_and_evaluate(
     n_train: int = 50000,
     lmax: int = 1000,
     max_epochs: int = 500,
-    lr: float = 5e-4,
+    lr: float = 1e-3,
     hidden_dim: int = 256,
     summary_dim: int = 2,
     full_cov: bool = False,
-    patience: int = 80,
+    patience: int = 50,
     seed: int = 42,
-    data_file: str = "synthetic/synthetic_lmax1000_n70000.npz",
+    data_file: str = "synthetic/synthetic_lmax1000_n70000_des_y3.npz",
 ):
     """Train VMIM compressor on synthetic data, evaluate, log to wandb."""
     import json
@@ -77,7 +77,7 @@ def train_and_evaluate(
     from lightning.pytorch.loggers import WandbLogger
     from torch.utils.data import DataLoader, TensorDataset
 
-    from lensing.sbi.compressor import VMIMCompressorV2
+    from lensing.sbi.compressor import VMIMCompressor
     from lensing.sbi.npe import train_npe, compute_fom
 
     t0 = time.time()
@@ -137,6 +137,18 @@ def train_and_evaluate(
     print(f"Data: {n_train} train / {n_val} val / {n_test} test, input_dim={input_dim}")
     print(f"Batch size: {batch_size} (GPU-resident tensors)")
 
+    # --- Data diagnostics ---
+    x_train = (spectra[train_idx] - spec_mean) / spec_std
+    y_train = (theta[train_idx] - theta_mean) / theta_std
+    print(f"Spectra raw: mean={spectra[train_idx].mean():.3e}, std={spectra[train_idx].std():.3e}, "
+          f"min={spectra[train_idx].min():.3e}, max={spectra[train_idx].max():.3e}")
+    print(f"Spectra norm: mean={x_train.mean():.3f}, std={x_train.std():.3f}, "
+          f"min={x_train.min():.3f}, max={x_train.max():.3f}")
+    print(f"Theta norm: mean={y_train.mean():.3f}, std={y_train.std():.3f}")
+    print(f"spec_std range: [{spec_std.min():.3e}, {spec_std.max():.3e}]")
+    print(f"NaN check: spectra={np.isnan(spectra).sum()}, theta={np.isnan(theta).sum()}")
+    print(f"Inf check: spectra={np.isinf(spectra).sum()}, theta={np.isinf(theta).sum()}")
+
     # --- Fisher FoM (pre-computed) ---
     fisher_fom = FISHER_FOM.get(lmax)
     if fisher_fom:
@@ -166,9 +178,7 @@ def train_and_evaluate(
     run_dir.mkdir(parents=True, exist_ok=True)
 
     # --- Build model ---
-    steps_per_epoch = max(1, n_train // batch_size)
-
-    model = VMIMCompressorV2(
+    model = VMIMCompressor(
         input_dim=input_dim,
         summary_dim=summary_dim,
         theta_dim=2,
@@ -177,8 +187,7 @@ def train_and_evaluate(
         lr=lr,
         min_lr=1e-4,
         weight_decay=1e-4,
-        warmup_steps=steps_per_epoch * 3,
-        plateau_patience=15,
+        plateau_patience=5,
         plateau_factor=0.5,
         theta_std=theta_std,
     )
@@ -201,10 +210,10 @@ def train_and_evaluate(
     fom_tracker = FoMTracker()
     callbacks = [
         fom_tracker,
-        EarlyStopping(monitor="val_fom_median", patience=patience, mode="max"),
+        EarlyStopping(monitor="val_loss", patience=patience, mode="min"),
         ModelCheckpoint(
             dirpath=str(run_dir), filename="compressor-best",
-            monitor="val_fom_median", mode="max",
+            monitor="val_loss", mode="min",
         ),
     ]
 
@@ -222,7 +231,7 @@ def train_and_evaluate(
     # Load best checkpoint
     best_path = callbacks[2].best_model_path
     if best_path:
-        model = VMIMCompressorV2.load_from_checkpoint(
+        model = VMIMCompressor.load_from_checkpoint(
             best_path, theta_std=theta_std, weights_only=False
         )
     model = model.cpu()
@@ -354,11 +363,11 @@ def main(
     n_train: int = 50000,
     lmax: int = 1000,
     max_epochs: int = 500,
-    lr: float = 5e-4,
+    lr: float = 1e-3,
     hidden_dim: int = 256,
     summary_dim: int = 2,
     full_cov: bool = False,
-    patience: int = 80,
+    patience: int = 50,
     seed: int = 42,
     sweep: bool = False,
 ):

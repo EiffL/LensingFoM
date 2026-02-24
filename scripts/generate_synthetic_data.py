@@ -57,11 +57,19 @@ def generate_on_gpu(
     n_ell: int = 20,
     seed: int = 0,
     batch_size: int = 5000,
+    noise_level: str = "noiseless",
 ):
     """Generate synthetic spectra with batched jax-cosmo on GPU.
 
     Fully vectorized: vmap for theory C_ell, then vectorized numpy for
-    cosmic variance noise (Cholesky decomposition + matmul, no per-sample loop).
+    cosmic variance + shape noise (Cholesky decomposition + matmul).
+
+    Parameters
+    ----------
+    noise_level : str
+        "noiseless" (cosmic variance only), "des_y3", or "lsst_y10".
+        Shape noise adds N_ell to auto-spectra in both the covariance
+        and observed spectra (noise bias).
     """
     import time
     import numpy as np
@@ -88,7 +96,32 @@ def generate_on_gpu(
 
     t0 = time.time()
     PAIR_TO_IJ = list(SPEC_PAIRS)
+    ARCMIN2_PER_SR = (180.0 * 60.0 / np.pi) ** 2
     n_pairs = 10
+
+    # --- Noise power spectrum N_ell ---
+    NOISE_CONFIGS = {
+        "noiseless": None,
+        "des_y3": {
+            "n_eff_arcmin2": [1.476, 1.479, 1.484, 1.461],
+            "sigma_e": [0.243, 0.262, 0.259, 0.301],
+        },
+        "lsst_y10": {
+            "n_eff_arcmin2": [6.75, 6.75, 6.75, 6.75],
+            "sigma_e": [0.26, 0.26, 0.26, 0.26],
+        },
+    }
+
+    noise_cfg = NOISE_CONFIGS[noise_level]
+    # N_ell vector (10,): non-zero only for auto-spectra (i==j)
+    n_ell_noise = np.zeros(n_pairs, dtype=np.float64)
+    if noise_cfg is not None:
+        n_eff_sr = [n * ARCMIN2_PER_SR for n in noise_cfg["n_eff_arcmin2"]]
+        sigma_e = noise_cfg["sigma_e"]
+        for p, (i, j) in enumerate(PAIR_TO_IJ):
+            if i == j:
+                n_ell_noise[p] = sigma_e[i] ** 2 / (2.0 * n_eff_sr[i])
+        print(f"Shape noise ({noise_level}): N_ell auto = {n_ell_noise[n_ell_noise > 0]}")
 
     # --- Ell bins ---
     ell_min = 2 * np.pi / TILE_SIDE_RAD
@@ -149,22 +182,22 @@ def generate_on_gpu(
     cls_theory_all = np.concatenate(all_cls, axis=0)  # (n_samples, 10, n_ell_out)
     print(f"Theory done in {time.time() - t1:.1f}s")
 
-    # --- Vectorized cosmic variance noise ---
-    # For each sample, at each ell:
-    #   Cov(C^{ab}, C^{cd}) = (C^{ac}*C^{bd} + C^{ad}*C^{bc}) / nu
-    # where nu = (2*ell+1)*f_sky
-    #
-    # Strategy: build all covariance matrices, Cholesky decompose, multiply
-    # by standard normal draws. Process in chunks to manage memory.
-    print("Adding cosmic variance noise (vectorized)...")
+    # --- Vectorized cosmic variance + shape noise ---
+    # Covariance uses C_total = C_signal + N_ell:
+    #   Cov(C^{ab}, C^{cd}) = (C_tot^{ac}*C_tot^{bd} + C_tot^{ad}*C_tot^{bc}) / nu
+    # Observed spectra = C_signal + N_ell (noise bias) + noise realization
+    print(f"Adding noise (vectorized, noise_level={noise_level})...")
     t2 = time.time()
 
-    # Pre-build pair index arrays for vectorized covariance construction
-    pair_a = np.array([a for a, b in PAIR_TO_IJ])  # (10,)
-    pair_b = np.array([b for a, b in PAIR_TO_IJ])  # (10,)
     nu = (2 * ell_eff + 1) * f_sky  # (n_ell_out,)
 
-    noise_chunk = 10000  # process this many samples at once
+    # N_ell matrix for 4x4 format (diagonal only)
+    n_ell_mat = np.zeros((4, 4), dtype=np.float64)
+    for p, (i, j) in enumerate(PAIR_TO_IJ):
+        if i == j:
+            n_ell_mat[i, j] = n_ell_noise[p]
+
+    noise_chunk = 10000
     spectra = np.zeros((n_samples, n_pairs * n_ell_out), dtype=np.float32)
 
     for chunk_start in range(0, n_samples, noise_chunk):
@@ -172,16 +205,16 @@ def generate_on_gpu(
         chunk_n = chunk_end - chunk_start
         cls_chunk = cls_theory_all[chunk_start:chunk_end]  # (chunk_n, 10, n_ell_out)
 
-        # Build 4x4 C_ell matrix: (chunk_n, n_ell_out, 4, 4)
+        # Build 4x4 C_total matrix: signal + noise
         cl_mat = np.zeros((chunk_n, n_ell_out, 4, 4), dtype=np.float64)
         for p, (a, b) in enumerate(PAIR_TO_IJ):
             cl_mat[:, :, a, b] = cls_chunk[:, p, :]
             if a != b:
                 cl_mat[:, :, b, a] = cls_chunk[:, p, :]
+        # Add shape noise N_ell to diagonal (auto-spectra)
+        cl_mat += n_ell_mat[np.newaxis, np.newaxis, :, :]
 
-        # Build 10x10 covariance at each (sample, ell): (chunk_n, n_ell_out, 10, 10)
-        # Cov[p1,p2] = (C[a,c]*C[b,d] + C[a,d]*C[b,c]) / nu
-        # Use advanced indexing for full vectorization
+        # Build 10x10 covariance using C_total
         cov = np.zeros((chunk_n, n_ell_out, n_pairs, n_pairs), dtype=np.float64)
         for p1, (a, b) in enumerate(PAIR_TO_IJ):
             for p2, (c, d) in enumerate(PAIR_TO_IJ):
@@ -190,22 +223,23 @@ def generate_on_gpu(
                     cl_mat[:, :, a, d] * cl_mat[:, :, b, c]
                 ) / nu[np.newaxis, :]
 
-        # Cholesky decompose at each (sample, ell)
-        # Add small regularization for numerical stability
+        # Cholesky + noise realization
         cov += 1e-35 * np.eye(n_pairs)[np.newaxis, np.newaxis, :, :]
-        # Shape: (chunk_n, n_ell_out, 10, 10) -> reshape for batch cholesky
         flat_shape = (chunk_n * n_ell_out, n_pairs, n_pairs)
         cov_flat = cov.reshape(flat_shape)
-        L_flat = np.linalg.cholesky(cov_flat)  # (chunk_n*n_ell_out, 10, 10)
+        L_flat = np.linalg.cholesky(cov_flat)
         L = L_flat.reshape(chunk_n, n_ell_out, n_pairs, n_pairs)
 
-        # Draw standard normal and transform: noise = L @ z
         z = rng.standard_normal((chunk_n, n_ell_out, n_pairs, 1))
         noise = (L @ z).squeeze(-1)  # (chunk_n, n_ell_out, 10)
 
-        # Add noise to theory and flatten to (chunk_n, 10*n_ell_out)
-        cls_noisy = cls_chunk + noise.transpose(0, 2, 1)  # (chunk_n, 10, n_ell_out)
-        spectra[chunk_start:chunk_end] = cls_noisy.reshape(chunk_n, -1).astype(np.float32)
+        # Observed = signal + noise_bias + noise_realization
+        cls_obs = cls_chunk.copy()
+        # Add N_ell noise bias to auto-spectra
+        cls_obs += n_ell_noise[np.newaxis, :, np.newaxis]
+        # Add noise realization
+        cls_obs += noise.transpose(0, 2, 1)
+        spectra[chunk_start:chunk_end] = cls_obs.reshape(chunk_n, -1).astype(np.float32)
 
         if chunk_end % 10000 == 0 or chunk_end == n_samples:
             print(f"  Noise: {chunk_end}/{n_samples}")
@@ -215,7 +249,8 @@ def generate_on_gpu(
     # --- Save ---
     out_dir = Path(RESULTS_DIR) / "synthetic"
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"synthetic_lmax{lmax}_n{n_samples}.npz"
+    suffix = f"_{noise_level}" if noise_level != "noiseless" else ""
+    out_path = out_dir / f"synthetic_lmax{lmax}_n{n_samples}{suffix}.npz"
 
     np.savez(
         out_path,
@@ -226,6 +261,7 @@ def generate_on_gpu(
         f_sky=f_sky,
         n_samples=n_samples,
         seed=seed,
+        noise_level=noise_level,
     )
     vol.commit()
 
@@ -241,45 +277,19 @@ def main(
     n_samples: int = 70000,
     lmax: int = 1000,
     seed: int = 0,
+    noise_level: str = "des_y3",
     local: bool = False,
 ):
     if local:
-        import sys
-        from pathlib import Path
-        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-        from lensing.sbi.synthetic import sample_mock_spectra
-        import numpy as np
-        import time
-
-        out_dir = Path("data/synthetic")
-        out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / f"synthetic_lmax{lmax}_n{n_samples}.npz"
-
-        if out_path.exists():
-            print(f"{out_path} already exists")
-            return
-
-        t0 = time.time()
-        spectra, theta, ell_eff = sample_mock_spectra(n_samples, lmax, seed=seed)
-        elapsed = time.time() - t0
-
-        np.savez(
-            out_path,
-            spectra=spectra.astype(np.float32),
-            theta=theta.astype(np.float32),
-            ell_eff=ell_eff.astype(np.float32),
-            lmax=lmax,
-            f_sky=1.0/12,
-            n_samples=n_samples,
-            seed=seed,
-        )
-        print(f"Saved {out_path} in {elapsed:.1f}s")
+        raise NotImplementedError("Local generation not yet updated for noise_level. Use Modal.")
     else:
         result = generate_on_gpu.remote(
             n_samples=n_samples,
             lmax=lmax,
             seed=seed,
+            noise_level=noise_level,
         )
         print(f"\nResult: {result}")
+        suffix = f"_{noise_level}" if noise_level != "noiseless" else ""
         print(f"\nDownload with:")
-        print(f"  modal volume get lensing-results synthetic/synthetic_lmax{lmax}_n{n_samples}.npz data/synthetic/")
+        print(f"  modal volume get lensing-results synthetic/synthetic_lmax{lmax}_n{n_samples}{suffix}.npz data/synthetic/")
