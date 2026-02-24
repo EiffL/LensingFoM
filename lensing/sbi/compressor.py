@@ -19,7 +19,7 @@ class VMIMCompressor(L.LightningModule):
         input_dim=200,
         summary_dim=2,
         theta_dim=2,
-        hidden_dim=128,
+        hidden_dim=64,
         dropout=0.3,
         full_cov=False,
         lr=5e-4,
@@ -33,7 +33,7 @@ class VMIMCompressor(L.LightningModule):
         else:
             self.theta_std = None
 
-        # Compressor MLP: smaller + dropout
+        # Compressor MLP with dropout
         self.compressor = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -46,20 +46,14 @@ class VMIMCompressor(L.LightningModule):
             nn.Linear(64, summary_dim),
         )
 
-        # VMIM head output size depends on covariance parameterization
+        # VMIM head: linear map from summary to posterior params
         if full_cov:
-            # mu (theta_dim) + Cholesky lower-triangle entries: theta_dim*(theta_dim+1)/2
             n_chol = theta_dim * (theta_dim + 1) // 2
             head_out = theta_dim + n_chol
         else:
-            # mu (theta_dim) + log_sigma (theta_dim)
             head_out = theta_dim * 2
 
-        self.vmim_head = nn.Sequential(
-            nn.Linear(summary_dim, 64),
-            nn.GELU(),
-            nn.Linear(64, head_out),
-        )
+        self.vmim_head = nn.Linear(summary_dim, head_out)
 
     def forward(self, x):
         return self.compressor(x)
