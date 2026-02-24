@@ -6,3 +6,5 @@ matplotlib
 astropy
 dorian-astro
 pymaster
+lenstools @ git+https://github.com/EiffL/LensTools.git
+datasets

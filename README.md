@@ -57,7 +57,7 @@ modal volume ls lensing-results sim00001/
 modal run pipeline.py
 ```
 
-This processes all simulations in parallel (up to 100 concurrent containers). Each simulation takes ~5-10 minutes, so the full run completes in ~1-2 hours. The run is idempotent — simulations that already have output on the volume are skipped, so you can safely re-run after failures.
+This processes all simulations in parallel (up to 20 concurrent containers, to avoid overwhelming the UCL download server). Each simulation takes ~10 minutes, so the full run completes in ~7 hours. The run is idempotent — simulations that already have output on the volume are skipped, so you can safely re-run after failures.
 
 At the end, a summary is printed:
 
@@ -100,3 +100,59 @@ The Born raytracing C_ell agrees with CAMB Halofit theory to within:
 - Cosmic variance at low ell (< 100)
 - ~1% at intermediate ell (~200–500)
 - ~20% suppression at high ell (> 1000) due to resolution and non-linear effects beyond Halofit
+
+## Phase 2a: Tile Extraction & HuggingFace Dataset
+
+Full-sky convergence maps are filtered in harmonic space and projected onto flat tiles for downstream analysis (SBI with neural compression, or pseudo-Cl 2-point functions).
+
+### How it works
+
+1. **Harmonic filtering**: `map2alm(lmax)` → `rotate_alm(euler)` → `alm2map(nside_down)` ensures all tiles see identical harmonic-space processing
+2. **Rotation augmentation**: 3 fixed orientations of the sphere (identity, 90° about y, 90° about z) provide data augmentation while keeping tiles in equatorial positions (minimal projection distortion)
+3. **Tile extraction**: 4 equatorial HEALPix base tiles (faces 4–7, ~3400 deg² each) are extracted per orientation, giving 12 tiles per simulation per lmax
+
+### Configurations
+
+| lmax | Tile size | Angular scales | nside |
+|------|-----------|---------------|-------|
+| 200  | 128×128   | > 0.9°        | 128   |
+| 400  | 256×256   | > 0.45°       | 256   |
+| 600  | 256×256   | > 0.3°        | 256   |
+| 800  | 512×512   | > 0.23°       | 512   |
+| 1000 | 512×512   | > 0.18°       | 512   |
+
+### Running tile extraction (Stage 2)
+
+```bash
+# Single simulation
+modal run pipeline.py --stage 2 --sim-id 1
+
+# All simulations
+modal run pipeline.py --stage 2
+```
+
+### HuggingFace Dataset
+
+The extracted tiles are published as a HuggingFace dataset at [`EiffL/GowerStreetDESY3`](https://huggingface.co/datasets/EiffL/GowerStreetDESY3).
+
+```python
+from datasets import load_dataset
+
+ds = load_dataset("EiffL/GowerStreetDESY3", data_dir="data/lmax_600")
+sample = ds["train"][0]
+kappa = sample["kappa"]       # (4, 256, 256) convergence map
+omega_m = sample["Omega_m"]   # Matter density parameter
+s8 = sample["S8"]             # S8 = sigma_8 * sqrt(Omega_m / 0.3)
+```
+
+Each sample includes the convergence map tile (4 tomographic bins) and all cosmological parameters (Omega_m, sigma_8, S8, w, h, n_s, Omega_b, m_nu).
+
+#### Building and pushing the dataset
+
+```bash
+# Build parquet shards on Modal volume (all lmax values)
+modal run scripts/build_hf_dataset.py
+
+# Push to HuggingFace Hub (requires huggingface-secret on Modal)
+modal run scripts/push_hf_dataset.py
+```

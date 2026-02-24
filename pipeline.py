@@ -1,4 +1,4 @@
-"""Modal pipeline — Stage 1: Generate convergence maps for all Gower Street sims."""
+"""Modal pipeline — Stage 1: Generate convergence maps; Stage 2: Extract filtered tiles."""
 
 import json
 import tarfile
@@ -24,20 +24,20 @@ image = (
 app = modal.App("lensing-fom", image=image)
 
 vol = modal.Volume.from_name("lensing-results", create_if_missing=True)
-
 RESULTS_DIR = "/results"
 CSV_PATH = "/pipeline/gower_street_runs.csv"
 NZ_PATH = "/pipeline/des_y3_2pt.fits"
 NSIDE_OUT = 1024
 SIM_URL = "http://star.ucl.ac.uk/GowerStreetSims/simulations/sim{sim_id:05d}.tar.gz"
+LMAX_VALUES = [200, 400, 600, 800, 1000]
 
 
 @app.function(
     volumes={RESULTS_DIR: vol},
     timeout=1800,
-    memory=8192,
+    memory=2048,
     retries=modal.Retries(max_retries=3, initial_delay=5.0, backoff_coefficient=2.0),
-    max_containers=100,
+    max_containers=10,
 )
 def process_simulation(sim_id: int) -> dict:
     import shutil
@@ -125,18 +125,84 @@ def process_simulation(sim_id: int) -> dict:
     return {"sim_id": sim_id, "status": "ok"}
 
 
+@app.function(
+    volumes={RESULTS_DIR: vol},
+    timeout=1800,
+    memory=1024,
+)
+def extract_tiles(sim_id: int) -> dict:
+    import numpy as np
+
+    from lensing.tiles import LMAX_TO_NSIDE, extract_tiles_for_lmax
+
+    sim_tag = f"sim{sim_id:05d}"
+    sim_dir = Path(RESULTS_DIR) / sim_tag
+    npz_path = sim_dir / "kappa_maps.npz"
+
+    # Check source exists
+    if not npz_path.exists():
+        print(f"{sim_tag}: no kappa_maps.npz, skipping")
+        return {"sim_id": sim_id, "status": "no_source"}
+
+    # Check if already done (all lmax files exist)
+    tile_paths = [sim_dir / f"tiles_lmax{lmax}.npz" for lmax in LMAX_VALUES]
+    if all(p.exists() for p in tile_paths):
+        print(f"{sim_tag}: tiles already exist, skipping")
+        return {"sim_id": sim_id, "status": "skipped"}
+
+    # Load full-sky kappa maps
+    data = np.load(npz_path)
+    kappa_maps = [data[f"kappa_bin{i}"] for i in range(4)]
+
+    for lmax in LMAX_VALUES:
+        tile_path = sim_dir / f"tiles_lmax{lmax}.npz"
+        if tile_path.exists():
+            continue
+
+        nside_down = LMAX_TO_NSIDE[lmax]
+        # Shape: (12, 4, nside_down, nside_down)
+        all_tiles = np.stack(
+            [extract_tiles_for_lmax(kappa_maps[b], lmax) for b in range(4)],
+            axis=1,
+        )
+        np.savez_compressed(tile_path, tiles=all_tiles)
+        print(f"{sim_tag}: saved {tile_path.name} shape={all_tiles.shape}")
+
+    vol.commit()
+    return {"sim_id": sim_id, "status": "ok"}
+
+
 @app.local_entrypoint()
-def main(sim_id: int = None):
-    if sim_id is not None:
-        result = process_simulation.remote(sim_id)
-        print(result)
-    else:
-        sim_ids = list(range(1, 792))
-        results = list(process_simulation.map(sim_ids, return_exceptions=True))
-        successes = [r for r in results if not isinstance(r, Exception)]
-        failures = [
-            (sim_ids[i], r) for i, r in enumerate(results) if isinstance(r, Exception)
-        ]
-        print(f"{len(successes)} succeeded, {len(failures)} failed")
-        for sid, err in failures:
-            print(f"  sim{sid:05d}: {err}")
+def main(sim_id: int = None, stage: int = 1):
+    if stage == 1:
+        if sim_id is not None:
+            result = process_simulation.remote(sim_id)
+            print(result)
+        else:
+            sim_ids = list(range(1, 792))
+            results = list(process_simulation.map(sim_ids, return_exceptions=True))
+            successes = [r for r in results if not isinstance(r, Exception)]
+            failures = [
+                (sim_ids[i], r)
+                for i, r in enumerate(results)
+                if isinstance(r, Exception)
+            ]
+            print(f"{len(successes)} succeeded, {len(failures)} failed")
+            for sid, err in failures:
+                print(f"  sim{sid:05d}: {err}")
+    elif stage == 2:
+        if sim_id is not None:
+            result = extract_tiles.remote(sim_id)
+            print(result)
+        else:
+            sim_ids = list(range(1, 792))
+            results = list(extract_tiles.map(sim_ids, return_exceptions=True))
+            successes = [r for r in results if not isinstance(r, Exception)]
+            failures = [
+                (sim_ids[i], r)
+                for i, r in enumerate(results)
+                if isinstance(r, Exception)
+            ]
+            print(f"Stage 2: {len(successes)} succeeded, {len(failures)} failed")
+            for sid, err in failures:
+                print(f"  sim{sid:05d}: {err}")
