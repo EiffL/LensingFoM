@@ -175,10 +175,10 @@ def main(
     noise_level: str = "des_y3",
     max_epochs: int = 1000,
     lr: float = 5e-4,
-    summary_dim: int = 4,
+    summary_dim: int = 2,
     backbone: str = "efficientnet_v2_s",
     full_cov: bool = False,
-    batch_size: int = 128,
+    batch_size: int = 256,
     weight_decay: float = 1e-4,
 ):
     result = train_and_evaluate.remote(

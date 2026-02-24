@@ -56,13 +56,14 @@ class FieldLevelCompressor(L.LightningModule):
         self,
         nside=128,
         n_bins=4,
-        summary_dim=4,
+        summary_dim=2,
         theta_dim=2,
         backbone="efficientnet_v2_s",
         full_cov=False,
         lr=5e-4,
         weight_decay=1e-4,
         warmup_epochs=0,
+        theta_noise_std=0.005,
         theta_std=None,
     ):
         super().__init__()
@@ -216,6 +217,8 @@ class FieldLevelCompressor(L.LightningModule):
     def training_step(self, batch, batch_idx):
         x, theta = batch
         x = self._augment(x)
+        if self.hparams.theta_noise_std > 0:
+            theta = theta + torch.randn_like(theta) * self.hparams.theta_noise_std
         loss, fom = self._nll_and_fom(x, theta)
         self.log("train_loss", loss, prog_bar=True)
         self.log("train_fom_median", fom.median(), prog_bar=False)

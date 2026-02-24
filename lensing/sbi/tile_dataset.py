@@ -110,8 +110,8 @@ class TileDataModule(L.LightningDataModule):
 
     def train_dataloader(self):
         x, y = self.train_ds.tensors()
-        return DataLoader(TensorDataset(x, y), batch_size=self.batch_size, shuffle=True, num_workers=4, persistent_workers=True)
+        return DataLoader(TensorDataset(x, y), batch_size=self.batch_size, shuffle=True, num_workers=4, persistent_workers=True, pin_memory=True)
 
     def val_dataloader(self):
         x, y = self.val_ds.tensors()
-        return DataLoader(TensorDataset(x, y), batch_size=self.batch_size, num_workers=4, persistent_workers=True)
+        return DataLoader(TensorDataset(x, y), batch_size=self.batch_size, num_workers=4, persistent_workers=True, pin_memory=True)
