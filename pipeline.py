@@ -262,10 +262,20 @@ def extract_tiles(sim_id: int) -> dict:
 # ---------------------------------------------------------------------------
 
 
+def _shard_is_valid(path, expected_min_rows: int = 1) -> bool:
+    """Check if a parquet shard exists and is readable with enough rows."""
+    import pyarrow.parquet as pq
+    try:
+        meta = pq.read_metadata(str(path))
+        return meta.num_rows >= expected_min_rows
+    except Exception:
+        return False
+
+
 @app.function(
     volumes={RESULTS_DIR: vol},
-    timeout=3600,
-    memory=8192,
+    timeout=7200,
+    memory=32768,
 )
 def build_parquet_for_config(lmax: int, noise_level: str) -> dict:
     """Build parquet shards for one (lmax, noise_level) combination."""
@@ -281,9 +291,22 @@ def build_parquet_for_config(lmax: int, noise_level: str) -> dict:
     total_tiles = 0
     shard_idx = 0
     skipped = 0
+    shards_skipped = 0
 
     for shard_start in range(1, 792, SIMS_PER_SHARD):
         shard_end = min(shard_start + SIMS_PER_SHARD, 792)
+        shard_path = out_dir / f"shard_{shard_idx:04d}.parquet"
+
+        # Skip shards that already exist and are valid parquet
+        if shard_path.exists() and _shard_is_valid(shard_path):
+            shard_idx += 1
+            shards_skipped += 1
+            continue
+        elif shard_path.exists():
+            # Corrupt shard — remove and rebuild
+            shard_path.unlink()
+            print(f"lmax={lmax}/{noise_level}: removed corrupt {shard_path.name}, rebuilding")
+
         records = []
 
         for sim_id in range(shard_start, shard_end):
@@ -320,7 +343,6 @@ def build_parquet_for_config(lmax: int, noise_level: str) -> dict:
                 })
 
         if records:
-            shard_path = out_dir / f"shard_{shard_idx:04d}.parquet"
             ds = Dataset.from_list(records)
             ds.to_parquet(str(shard_path))
             total_tiles += len(records)
@@ -329,7 +351,10 @@ def build_parquet_for_config(lmax: int, noise_level: str) -> dict:
         shard_idx += 1
 
     vol.commit()
-    print(f"lmax={lmax}/{noise_level}: done — {total_tiles} tiles in {shard_idx} shards, {skipped} sims skipped")
+    if shards_skipped:
+        print(f"lmax={lmax}/{noise_level}: done — {shards_skipped} shards already existed, {shard_idx - shards_skipped} new shards built")
+    else:
+        print(f"lmax={lmax}/{noise_level}: done — {total_tiles} tiles in {shard_idx} shards, {skipped} sims skipped")
     return {"lmax": lmax, "noise_level": noise_level, "total_tiles": total_tiles, "shards": shard_idx, "skipped": skipped}
 
 
@@ -340,7 +365,7 @@ def build_parquet_for_config(lmax: int, noise_level: str) -> dict:
 
 @app.function(
     volumes={RESULTS_DIR: vol},
-    timeout=3600,
+    timeout=7200,
     memory=4096,
     secrets=[modal.Secret.from_name("huggingface-secret")],
 )
@@ -375,14 +400,13 @@ def push_to_hub(
                 print(f"{config_name}: no parquet files, skipping")
                 continue
 
-            for pf in parquet_files:
-                api.upload_file(
-                    path_or_fileobj=str(pf),
-                    path_in_repo=f"data/{config_name}/{pf.name}",
-                    repo_id=repo_id,
-                    repo_type="dataset",
-                )
-                print(f"{config_name}: uploaded {pf.name}")
+            api.upload_folder(
+                folder_path=str(config_dir),
+                path_in_repo=f"data/{config_name}",
+                repo_id=repo_id,
+                repo_type="dataset",
+                allow_patterns="shard_*.parquet",
+            )
 
             pushed[config_name] = len(parquet_files)
             print(f"{config_name}: pushed {len(parquet_files)} shards")
@@ -414,6 +438,11 @@ def build_spectra_for_config(lmax: int, noise_level: str) -> dict:
     out_dir = Path(RESULTS_DIR) / "spectra_dataset"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"spectra_lmax{lmax}_noise_{noise_level}.parquet"
+
+    # Skip if output already exists
+    if out_path.exists():
+        print(f"lmax={lmax}/{noise_level}: {out_path.name} already exists, skipping")
+        return {"lmax": lmax, "noise_level": noise_level, "total_tiles": 0, "skipped": 0, "cached": True}
 
     records = []
     skipped = 0
