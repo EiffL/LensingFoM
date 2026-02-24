@@ -24,6 +24,49 @@ ORIENTATIONS = [
 # Equatorial tile indices (least distorted when projected to 2D)
 EQUATORIAL_TILES = [4, 5, 6, 7]
 
+# Survey noise configurations: per-bin n_eff (arcmin^-2) and sigma_e
+# DES Y3: Amon et al. 2022, Table 1, arXiv:2105.13543
+# LSST Y10: DESC SRD, arXiv:1809.01669 (27 arcmin^-2 total / 4 bins)
+NOISE_CONFIGS = {
+    "des_y3": {
+        "n_eff_arcmin2": [1.476, 1.479, 1.484, 1.461],
+        "sigma_e": [0.243, 0.262, 0.259, 0.301],
+    },
+    "lsst_y10": {
+        "n_eff_arcmin2": [6.75, 6.75, 6.75, 6.75],
+        "sigma_e": [0.26, 0.26, 0.26, 0.26],
+    },
+}
+
+# Conversion factor: 1 steradian = (180*60/pi)^2 arcmin^2
+_ARCMIN2_PER_SR = (180.0 * 60.0 / np.pi) ** 2
+
+
+def add_shape_noise(hpx_map, n_eff_arcmin2, sigma_e, rng):
+    """Add Gaussian shape noise to a HEALPix convergence map.
+
+    Parameters
+    ----------
+    hpx_map : np.ndarray
+        RING-ordered HEALPix map.
+    n_eff_arcmin2 : float
+        Effective galaxy number density in arcmin^-2.
+    sigma_e : float
+        Per-component intrinsic ellipticity dispersion.
+    rng : np.random.Generator
+        NumPy random generator for reproducibility.
+
+    Returns
+    -------
+    noisy_map : np.ndarray
+        Map with added Gaussian noise.
+    """
+    npix = len(hpx_map)
+    a_pix = 4.0 * np.pi / npix  # pixel area in steradians
+    n_gal_sr = n_eff_arcmin2 * _ARCMIN2_PER_SR  # convert to sr^-1
+    sigma_pix = sigma_e / np.sqrt(2.0 * n_gal_sr * a_pix)
+    return hpx_map + rng.normal(0.0, sigma_pix, size=npix)
+
 
 def healpix_to_tile(hpx_map, tile_id):
     """Extract a single square 2D image from a HEALPix map for one base tile.

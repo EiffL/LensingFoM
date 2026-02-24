@@ -95,3 +95,55 @@ def test_extract_tiles_for_lmax_orientations():
 
     # Tile 0 (orientation 0, equatorial tile 4) vs tile 4 (orientation 1, equatorial tile 4)
     assert not np.allclose(tiles[0], tiles[4])
+
+
+from lensing.tiles import NOISE_CONFIGS, add_shape_noise
+
+
+def test_noise_configs_keys():
+    """NOISE_CONFIGS has entries for des_y3 and lsst_y10, not noiseless."""
+    assert "des_y3" in NOISE_CONFIGS
+    assert "lsst_y10" in NOISE_CONFIGS
+    assert "noiseless" not in NOISE_CONFIGS
+    for key, cfg in NOISE_CONFIGS.items():
+        assert len(cfg["n_eff_arcmin2"]) == 4
+        assert len(cfg["sigma_e"]) == 4
+
+
+def test_add_shape_noise_changes_map():
+    """Adding shape noise should change the map."""
+    nside = 64
+    m = np.zeros(hp.nside2npix(nside))
+    rng = np.random.default_rng(42)
+    noisy = add_shape_noise(m, n_eff_arcmin2=1.5, sigma_e=0.26, rng=rng)
+    assert noisy.shape == m.shape
+    assert not np.allclose(noisy, m)
+
+
+def test_add_shape_noise_variance():
+    """Noise variance should match the analytic prediction."""
+    nside = 64
+    npix = hp.nside2npix(nside)
+    m = np.zeros(npix)
+    n_eff_arcmin2 = 1.5
+    sigma_e = 0.26
+    rng = np.random.default_rng(42)
+    noisy = add_shape_noise(m, n_eff_arcmin2=n_eff_arcmin2, sigma_e=sigma_e, rng=rng)
+
+    # Expected variance
+    arcmin2_per_sr = (180 * 60 / np.pi) ** 2
+    n_gal_sr = n_eff_arcmin2 * arcmin2_per_sr
+    a_pix = 4 * np.pi / npix
+    expected_var = sigma_e**2 / (2 * n_gal_sr * a_pix)
+
+    measured_var = np.var(noisy)
+    np.testing.assert_allclose(measured_var, expected_var, rtol=0.05)
+
+
+def test_add_shape_noise_deterministic():
+    """Same RNG seed should produce same noise."""
+    nside = 64
+    m = np.zeros(hp.nside2npix(nside))
+    noisy1 = add_shape_noise(m, 1.5, 0.26, rng=np.random.default_rng(42))
+    noisy2 = add_shape_noise(m, 1.5, 0.26, rng=np.random.default_rng(42))
+    np.testing.assert_array_equal(noisy1, noisy2)
