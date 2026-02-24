@@ -27,10 +27,12 @@
   - `raytracing.py` — Born-approximation raytracing with n(z) weighting
   - `validation.py` — Power spectrum measurement and comparison plots
   - `tiles.py` — Tile extraction from HEALPix maps with harmonic filtering, rotation, and shape noise injection
+  - `spectra.py` — Flat-sky FFT power spectrum estimation from projected tiles
 - `pipeline.py` — Modal pipeline: Stage 1 (Born raytracing), Stage 2 (tile extraction)
 - `scripts/`
   - `download_data.sh` — Download Gower Street sim00001 + DES Y3 FITS
   - `build_hf_dataset.py` — Build parquet shards from tiles on Modal volume
+  - `build_spectra_dataset.py` — Compute flat-sky auto/cross power spectra from tiles, save as parquet
   - `push_hf_dataset.py` — Push parquet shards to HuggingFace Hub
   - `healpix_to_tiles.py` — Standalone tile extraction demo
   - `lmax_filtering_demo.py` — Harmonic filtering demo
@@ -82,6 +84,12 @@ modal run scripts/push_hf_dataset.py
 
 # Push specific config
 modal run scripts/push_hf_dataset.py --lmax 200 --noise-level des_y3
+
+# Build spectra dataset (all 15 configs)
+modal run scripts/build_spectra_dataset.py
+
+# Build spectra for specific config
+modal run scripts/build_spectra_dataset.py --lmax 600 --noise-level des_y3
 ```
 
 ## Data Sources

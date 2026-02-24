@@ -121,13 +121,25 @@ Full-sky convergence maps are filtered in harmonic space and projected onto flat
 | 800  | 512×512   | > 0.23°       | 512   |
 | 1000 | 512×512   | > 0.18°       | 512   |
 
+### Shape noise levels
+
+Tiles are generated at 3 noise levels to study the impact of survey depth on constraining power:
+
+| Noise level | Survey | n_eff (arcmin^-2/bin) | sigma_e |
+|-------------|--------|----------------------|---------|
+| `noiseless` | — | — | — |
+| `des_y3` | DES Y3 | 1.46–1.48 | 0.24–0.30 |
+| `lsst_y10` | LSST Y10 | 6.75 | 0.26 |
+
+Shape noise is added as Gaussian pixel noise to the full-sky nside=1024 convergence map **before** harmonic filtering, so the noise is band-limited consistently with the signal. DES Y3 values from [Amon et al. 2022](https://arxiv.org/abs/2105.13543), LSST Y10 from [DESC SRD](https://arxiv.org/abs/1809.01669).
+
 ### Running tile extraction (Stage 2)
 
 ```bash
 # Single simulation
 modal run pipeline.py --stage 2 --sim-id 1
 
-# All simulations
+# All simulations (generates 15 tile files per sim: 5 lmax x 3 noise levels)
 modal run pipeline.py --stage 2
 ```
 
@@ -138,21 +150,37 @@ The extracted tiles are published as a HuggingFace dataset at [`EiffL/GowerStree
 ```python
 from datasets import load_dataset
 
-ds = load_dataset("EiffL/GowerStreetDESY3", data_dir="data/lmax_600")
+# Load a specific (lmax, noise_level) configuration
+ds = load_dataset("EiffL/GowerStreetDESY3", data_dir="data/lmax_600_des_y3")
 sample = ds["train"][0]
-kappa = sample["kappa"]       # (4, 256, 256) convergence map
-omega_m = sample["Omega_m"]   # Matter density parameter
-s8 = sample["S8"]             # S8 = sigma_8 * sqrt(Omega_m / 0.3)
+kappa = sample["kappa"]           # (4, 256, 256) convergence map
+omega_m = sample["Omega_m"]       # Matter density parameter
+noise = sample["noise_level"]     # "des_y3"
 ```
 
-Each sample includes the convergence map tile (4 tomographic bins) and all cosmological parameters (Omega_m, sigma_8, S8, w, h, n_s, Omega_b, m_nu).
+Each sample includes the convergence map tile (4 tomographic bins), noise level, and all cosmological parameters (Omega_m, sigma_8, S8, w, h, n_s, Omega_b, m_nu). Components are named `lmax_{lmax}_{noise_level}` (15 total = 5 lmax x 3 noise levels).
 
 #### Building and pushing the dataset
 
 ```bash
-# Build parquet shards on Modal volume (all lmax values)
+# Build parquet shards on Modal volume (all 15 configs)
 modal run scripts/build_hf_dataset.py
+
+# Build specific config
+modal run scripts/build_hf_dataset.py --lmax 600 --noise-level des_y3
 
 # Push to HuggingFace Hub (requires huggingface-secret on Modal)
 modal run scripts/push_hf_dataset.py
+```
+
+### Spectra dataset
+
+For 2-point function analysis, flat-sky auto/cross power spectra (10 per tile) are pre-computed from the tiles using 2D FFT with azimuthal binning.
+
+```bash
+# Build spectra for all (lmax, noise_level) configs
+modal run scripts/build_spectra_dataset.py
+
+# Single config
+modal run scripts/build_spectra_dataset.py --lmax 600 --noise-level des_y3
 ```
