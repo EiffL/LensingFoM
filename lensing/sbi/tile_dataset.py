@@ -23,6 +23,7 @@ def load_tiles_parquet(parquet_dir):
     -------
     tiles : np.ndarray, shape (N, 4, nside, nside)
     theta : np.ndarray, shape (N, 2)  — [Omega_m, S8]
+    sim_ids : np.ndarray, shape (N,)  — simulation ID for each tile
     """
     from pathlib import Path
     shards = sorted(Path(parquet_dir).glob("shard_*.parquet"))
@@ -30,7 +31,8 @@ def load_tiles_parquet(parquet_dir):
     ds = ds.with_format("numpy")
     tiles = np.array(ds["kappa"], dtype=np.float32)
     theta = np.column_stack([ds["Omega_m"], ds["S8"]]).astype(np.float32)
-    return tiles, theta
+    sim_ids = np.array(ds["sim_id"], dtype=np.int32)
+    return tiles, theta, sim_ids
 
 
 class TileDataset:
@@ -74,7 +76,7 @@ class TileDataModule(L.LightningDataModule):
         self._val_dl = None
 
     def setup(self, stage=None):
-        tiles, theta = load_tiles_parquet(self.parquet_dir)
+        tiles, theta, _sim_ids = load_tiles_parquet(self.parquet_dir)
 
         # Shuffle and split 80/10/10 — mirrors SpectraDataModule exactly
         rng = np.random.default_rng(self.seed)
