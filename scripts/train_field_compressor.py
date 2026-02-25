@@ -23,8 +23,8 @@ RESULTS_DIR = "/results"
 
 @app.function(
     volumes={RESULTS_DIR: vol},
-    gpu="H100",
-    timeout=7200,
+    gpu="A100-80GB",
+    timeout=72000,
     memory=32768,
     secrets=[modal.Secret.from_name("wandb-secret")],
 )
@@ -38,7 +38,7 @@ def train_compressor(
     weight_decay: float = 1e-5,
     warmup_steps: int = 500,
     decay_rate: float = 0.85,
-    decay_every_epochs: int = 10,
+    decay_every_epochs: int = 20,
 ):
     """Train field-level MSE compressor, save checkpoint and norm stats."""
     import json
