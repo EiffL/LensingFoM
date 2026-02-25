@@ -178,7 +178,7 @@ def main(
     summary_dim: int = 2,
     backbone: str = "efficientnet_v2_s",
     full_cov: bool = False,
-    batch_size: int = 256,
+    batch_size: int = 128,
     weight_decay: float = 1e-4,
 ):
     result = train_and_evaluate.remote(
