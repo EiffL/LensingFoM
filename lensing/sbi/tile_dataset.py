@@ -101,7 +101,9 @@ class CompressedTileDataset(Dataset):
             tile = self._augment_tile(tile)
 
         with torch.no_grad():
-            summary = self.compressor(tile.unsqueeze(0)).squeeze(0)
+            params = list(self.compressor.parameters())
+            device = params[0].device if params else torch.device("cpu")
+            summary = self.compressor(tile.unsqueeze(0).to(device)).squeeze(0).cpu()
 
         return summary, theta
 
