@@ -3,7 +3,6 @@
 Usage:
     modal run scripts/train_field_compressor.py
     modal run scripts/train_field_compressor.py --lmax 200 --noise-level des_y3
-    modal run scripts/train_field_compressor.py --backbone efficientnet_b0 --batch-size 128
 """
 
 import modal
@@ -29,7 +28,7 @@ RESULTS_DIR = "/results"
     memory=32768,
     secrets=[modal.Secret.from_name("wandb-secret")],
 )
-def train_and_evaluate(
+def train_compressor(
     lmax: int = 200,
     noise_level: str = "des_y3",
     max_epochs: int = 500,
@@ -41,7 +40,7 @@ def train_and_evaluate(
     decay_rate: float = 0.85,
     decay_every_epochs: int = 10,
 ):
-    """Train field-level MSE compressor, log loss to wandb."""
+    """Train field-level MSE compressor, save checkpoint and norm stats."""
     import json
     import time
     from pathlib import Path
@@ -69,15 +68,16 @@ def train_and_evaluate(
             f"{parquet_dir} not found. Run pipeline.py --stage 3 first."
         )
 
-    dm = TileDataModule(parquet_dir, batch_size=batch_size)
+    dm = TileDataModule(parquet_dir, batch_size=batch_size, fiducial_sim_id=109)
     dm.setup()
 
     n_train = len(dm.train_ds)
     n_val = len(dm.val_ds)
     n_test = len(dm.test_ds)
+    n_fid = len(dm.fiducial_ds) if dm.fiducial_ds else 0
 
-    print(f"Loaded {n_train + n_val + n_test} tiles from {parquet_dir}")
-    print(f"Split: {n_train} train / {n_val} val / {n_test} test")
+    print(f"Loaded {n_train + n_val + n_test + n_fid} tiles from {parquet_dir}")
+    print(f"Split: {n_train} train / {n_val} val / {n_test} test / {n_fid} fiducial")
     print(f"Tile shape: (4, {nside}, {nside})")
 
     # --- Build model ---
@@ -127,7 +127,7 @@ def train_and_evaluate(
     )
     trainer.fit(model, dm)
 
-    # --- Evaluate on all splits ---
+    # --- Evaluate MSE on all splits ---
     best_path = ckpt_callback.best_model_path
     if best_path:
         model = FieldLevelCompressor.load_from_checkpoint(
@@ -135,66 +135,38 @@ def train_and_evaluate(
         )
     model = model.cpu().eval()
 
-    # --- MSE on all splits ---
     splits = {}
-    compressed = {}
     for split_name, ds in [("train", dm.train_ds), ("val", dm.val_ds), ("test", dm.test_ds)]:
         x, theta = ds.tensors()
         with torch.no_grad():
             pred = model(x)
             mse = torch.nn.functional.mse_loss(pred, theta)
-        splits[split_name] = {"mse": float(mse)}
-        compressed[split_name] = (pred.numpy(), theta.numpy())
+        splits[split_name] = float(mse)
         print(f"{split_name:5s} MSE: {float(mse):.6f}")
 
-    # --- Train Gaussian NPE on val set, evaluate FoM ---
-    from lensing.sbi.npe import train_npe, compute_fom
-
-    print("\nTraining Gaussian NPE on val compressed summaries...")
-    val_pred, val_theta = compressed["val"]
-    test_pred, test_theta = compressed["test"]
-    train_pred, train_theta = compressed["train"]
-
-    npe = train_npe(
-        val_pred, val_theta,
-        val_summaries=test_pred, val_theta=test_theta,
-        max_epochs=500, patience=30,
-    )
-    npe = npe.cpu().eval()
-
-    # Un-normalize FoM: NPE works in normalized theta space,
-    # scale by 1/prod(theta_std) to get physical FoM
-    theta_std_prod = float(dm.train_ds.theta_std.prod())
-
-    for split_name, (pred, theta) in compressed.items():
-        fom_median, fom_lo, fom_hi, fom_all = compute_fom(npe, pred)
-        # Convert to physical units
-        fom_median /= theta_std_prod
-        fom_lo /= theta_std_prod
-        fom_hi /= theta_std_prod
-        splits[split_name]["fom"] = fom_median
-        splits[split_name]["fom_lo"] = fom_lo
-        splits[split_name]["fom_hi"] = fom_hi
-        print(f"{split_name:5s} FoM: {fom_median:.1f} [{fom_lo:.1f}, {fom_hi:.1f}]")
-
     wandb_logger.experiment.summary.update({
-        f"{s}/mse": v["mse"] for s, v in splits.items()
-    })
-    wandb_logger.experiment.summary.update({
-        f"{s}/fom": v["fom"] for s, v in splits.items()
+        f"{s}/mse": v for s, v in splits.items()
     })
 
+    # --- Save normalization stats ---
+    norm_stats = {
+        "tile_mean": dm.train_ds.tile_mean.tolist(),
+        "tile_std": dm.train_ds.tile_std.tolist(),
+        "theta_mean": dm.train_ds.theta_mean.tolist(),
+        "theta_std": dm.train_ds.theta_std.tolist(),
+    }
+    with open(run_dir / "norm_stats.json", "w") as f:
+        json.dump(norm_stats, f, indent=2)
+
+    # --- Save result ---
     result = dict(
         lmax=lmax, noise_level=noise_level, nside=nside,
-        n_train=n_train, n_val=n_val, n_test=n_test,
+        n_train=n_train, n_val=n_val, n_test=n_test, n_fiducial=n_fid,
         backbone=backbone,
         max_lr=max_lr, batch_size=batch_size, weight_decay=weight_decay,
-        train_mse=splits["train"]["mse"],
-        val_mse=splits["val"]["mse"],
-        test_mse=splits["test"]["mse"],
-        train_fom=splits["train"]["fom"],
-        val_fom=splits["val"]["fom"],
-        test_fom=splits["test"]["fom"],
+        train_mse=splits["train"],
+        val_mse=splits["val"],
+        test_mse=splits["test"],
         epochs_trained=trainer.current_epoch,
         elapsed_s=time.time() - t0,
     )
@@ -221,7 +193,7 @@ def main(
     decay_rate: float = 0.85,
     decay_every_epochs: int = 10,
 ):
-    result = train_and_evaluate.remote(
+    result = train_compressor.remote(
         lmax=lmax, noise_level=noise_level,
         max_epochs=max_epochs, max_lr=max_lr,
         backbone=backbone,
@@ -230,5 +202,4 @@ def main(
         decay_every_epochs=decay_every_epochs,
     )
     print(f"\nTrain MSE: {result['train_mse']:.6f}  Val MSE: {result['val_mse']:.6f}  Test MSE: {result['test_mse']:.6f}")
-    print(f"Train FoM: {result['train_fom']:.1f}  Val FoM: {result['val_fom']:.1f}  Test FoM: {result['test_fom']:.1f}")
     print(f"Trained {result['epochs_trained']} epochs in {result['elapsed_s']:.0f}s")
