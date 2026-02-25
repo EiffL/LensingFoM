@@ -60,35 +60,44 @@ class TileDataset:
 class TileDataModule(L.LightningDataModule):
     """Lightning DataModule for tile images from HuggingFace dataset.
 
-    3-way split (80/10/10%), shuffled. Same logic as SpectraDataModule.
-    Per-channel normalization stats computed from train split only.
+    Splits tiles into compressor-train (70%), NPE-train/compressor-val (25%),
+    and test (5%). Optionally holds out a fiducial simulation for FoM evaluation.
+    Per-channel normalization stats computed from compressor-train split only.
     """
 
-    def __init__(self, parquet_dir, batch_size=64, seed=42):
+    def __init__(self, parquet_dir, batch_size=64, seed=42, fiducial_sim_id=109):
         super().__init__()
         self.parquet_dir = parquet_dir
         self.batch_size = batch_size
         self.seed = seed
+        self.fiducial_sim_id = fiducial_sim_id
         self.train_ds = None
         self.val_ds = None
         self.test_ds = None
+        self.fiducial_ds = None
         self._train_dl = None
         self._val_dl = None
 
     def setup(self, stage=None):
-        tiles, theta, _sim_ids = load_tiles_parquet(self.parquet_dir)
+        tiles, theta, sim_ids = load_tiles_parquet(self.parquet_dir)
 
-        # Shuffle and split 80/10/10 — mirrors SpectraDataModule exactly
+        # Separate fiducial tiles
+        if self.fiducial_sim_id is not None:
+            fid_mask = sim_ids == self.fiducial_sim_id
+            fid_tiles, fid_theta = tiles[fid_mask], theta[fid_mask]
+            tiles, theta = tiles[~fid_mask], theta[~fid_mask]
+        else:
+            fid_tiles, fid_theta = None, None
+
+        # Shuffle and split 70/25/5
         rng = np.random.default_rng(self.seed)
         idx = np.arange(len(theta))
         rng.shuffle(idx)
-
-        tiles = tiles[idx]
-        theta = theta[idx]
+        tiles, theta = tiles[idx], theta[idx]
 
         n = len(idx)
-        n_train = int(0.8 * n)
-        n_val = int(0.1 * n)
+        n_train = int(0.70 * n)
+        n_val = int(0.25 * n)
 
         train_mask = np.zeros(n, dtype=bool)
         train_mask[:n_train] = True
@@ -97,9 +106,9 @@ class TileDataModule(L.LightningDataModule):
         test_mask = np.zeros(n, dtype=bool)
         test_mask[n_train + n_val:] = True
 
-        # Per-channel normalization stats from train split
-        tile_mean = tiles[train_mask].mean(axis=(0, 2, 3))  # (4,)
-        tile_std = tiles[train_mask].std(axis=(0, 2, 3))     # (4,)
+        # Per-channel normalization stats from compressor-train split
+        tile_mean = tiles[train_mask].mean(axis=(0, 2, 3))
+        tile_std = tiles[train_mask].std(axis=(0, 2, 3))
         tile_std = np.where(tile_std == 0, 1.0, tile_std)
 
         theta_mean = theta[train_mask].mean(axis=0)
@@ -112,7 +121,12 @@ class TileDataModule(L.LightningDataModule):
         self.val_ds = TileDataset(tiles[val_mask], theta[val_mask], *norm)
         self.test_ds = TileDataset(tiles[test_mask], theta[test_mask], *norm)
 
-        # Pre-build DataLoaders once (data is in-memory tensors, no workers needed)
+        if fid_tiles is not None and len(fid_tiles) > 0:
+            self.fiducial_ds = TileDataset(fid_tiles, fid_theta, *norm)
+        else:
+            self.fiducial_ds = None
+
+        # Pre-build DataLoaders
         self._train_dl = DataLoader(
             TensorDataset(self.train_ds.x, self.train_ds.y),
             batch_size=self.batch_size, shuffle=True, pin_memory=True,
