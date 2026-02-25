@@ -1,7 +1,8 @@
-"""Field-level VMIM compressor: EfficientNet backbone on convergence map tiles."""
+"""Field-level compressor: EfficientNet backbone on convergence map tiles."""
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 import lightning as L
 
@@ -25,44 +26,23 @@ def _build_backbone(name):
 
 
 class FieldLevelCompressor(L.LightningModule):
-    """Variational Mutual Information Maximization compressor for convergence map tiles.
+    """MSE regression compressor for convergence map tiles.
 
-    Uses an EfficientNet backbone for spatial feature extraction from 4-channel
-    tomographic convergence maps, followed by the same VMIM head as VMIMCompressor.
-
-    Parameters
-    ----------
-    nside : int
-        Tile pixel size (nside x nside input images).
-    n_bins : int
-        Number of tomographic bins (input channels).
-    summary_dim : int
-        Dimensionality of the compressed summary.
-    theta_dim : int
-        Dimensionality of the cosmological parameter vector.
-    backbone : str
-        EfficientNet variant: "efficientnet_v2_s", "efficientnet_b0", or "efficientnet_b2".
-    full_cov : bool
-        If True, predict full Cholesky covariance; otherwise diagonal.
-    lr : float
-        Learning rate for AdamW.
-    weight_decay : float
-        Weight decay for AdamW.
-    theta_std : list or None
-        Standard deviation of theta for un-normalizing FoM.
+    Uses an EfficientNet backbone to predict cosmological parameters
+    (Omega_m, S8) directly from 4-channel tomographic convergence maps.
     """
 
     def __init__(
         self,
         nside=128,
         n_bins=4,
-        summary_dim=2,
         theta_dim=2,
         backbone="efficientnet_v2_s",
-        full_cov=False,
-        lr=5e-4,
-        weight_decay=1e-4,
-        warmup_epochs=0,
+        max_lr=0.008,
+        weight_decay=1e-5,
+        warmup_steps=500,
+        decay_rate=0.85,
+        decay_every_epochs=10,
         theta_noise_std=0.005,
         theta_std=None,
     ):
@@ -91,32 +71,19 @@ class FieldLevelCompressor(L.LightningModule):
         )
         self.backbone = net.features  # drop classifier head
 
-        # Pooling + compressor head
+        # Pooling + regression head
         self.pool = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
         )
-        self.compressor_head = nn.Sequential(
-            nn.Linear(backbone_dim, 64),
+        self.head = nn.Sequential(
+            nn.Linear(backbone_dim, 128),
             nn.GELU(),
-            nn.Linear(64, summary_dim),
-        )
-
-        # VMIM head — same structure as VMIMCompressor
-        if full_cov:
-            n_chol = theta_dim * (theta_dim + 1) // 2
-            head_out = theta_dim + n_chol
-        else:
-            head_out = theta_dim * 2
-
-        self.vmim_head = nn.Sequential(
-            nn.Linear(summary_dim, 64),
-            nn.GELU(),
-            nn.Linear(64, head_out),
+            nn.Linear(128, theta_dim),
         )
 
     def forward(self, x):
-        """Compress tiles to summary vectors.
+        """Predict theta from tiles.
 
         Parameters
         ----------
@@ -124,68 +91,11 @@ class FieldLevelCompressor(L.LightningModule):
 
         Returns
         -------
-        t : Tensor, shape (B, summary_dim)
+        pred : Tensor, shape (B, theta_dim)
         """
         features = self.backbone(x)
         pooled = self.pool(features)
-        return self.compressor_head(pooled)
-
-    def _predict_posterior(self, t):
-        """From summary t, predict posterior mean and covariance factor.
-
-        Returns
-        -------
-        mu : (B, theta_dim)
-        L_or_sigma : (B, theta_dim, theta_dim) if full_cov else (B, theta_dim)
-        """
-        out = self.vmim_head(t)
-        d = self.hparams.theta_dim
-
-        if self.hparams.full_cov:
-            mu = out[:, :d]
-            chol_raw = out[:, d:]
-            B = t.shape[0]
-            L = torch.zeros(B, d, d, device=t.device)
-            idx = 0
-            for i in range(d):
-                for j in range(i + 1):
-                    if i == j:
-                        L[:, i, j] = nn.functional.softplus(chol_raw[:, idx]) + 1e-4
-                    else:
-                        L[:, i, j] = chol_raw[:, idx]
-                    idx += 1
-            return mu, L
-        else:
-            mu = out[:, :d]
-            sigma = nn.functional.softplus(out[:, d:]) + 1e-4
-            return mu, sigma
-
-    def _nll_and_fom(self, x, theta):
-        """Compute Gaussian NLL and per-sample FoM."""
-        t = self(x)
-        mu, L_or_sigma = self._predict_posterior(t)
-
-        if self.hparams.full_cov:
-            L = L_or_sigma
-            diff = theta - mu
-            z = torch.linalg.solve_triangular(L, diff.unsqueeze(-1), upper=False)
-            z = z.squeeze(-1)
-            log_det_L = L.diagonal(dim1=-2, dim2=-1).log().sum(-1)
-            nll = 0.5 * (z ** 2).sum(-1) + log_det_L
-            loss = nll.mean()
-            fom_norm = 1.0 / L.diagonal(dim1=-2, dim2=-1).prod(-1)
-        else:
-            sigma = L_or_sigma
-            nll = sigma.log() + 0.5 * ((theta - mu) / sigma) ** 2
-            loss = nll.mean()
-            fom_norm = 1.0 / sigma.prod(dim=-1)
-
-        if self.theta_std is not None:
-            fom_phys = fom_norm / self.theta_std.prod()
-        else:
-            fom_phys = fom_norm
-
-        return loss, fom_phys
+        return self.head(pooled)
 
     def _augment(self, x):
         """Random augmentation for training: rotations, flips, and circular rolls.
@@ -219,65 +129,49 @@ class FieldLevelCompressor(L.LightningModule):
         x = self._augment(x)
         if self.hparams.theta_noise_std > 0:
             theta = theta + torch.randn_like(theta) * self.hparams.theta_noise_std
-        loss, fom = self._nll_and_fom(x, theta)
+        pred = self(x)
+        loss = F.mse_loss(pred, theta)
         self.log("train_loss", loss, prog_bar=True)
-        self.log("train_fom_median", fom.median(), prog_bar=False)
         self.log("lr", self.optimizers().param_groups[0]["lr"], prog_bar=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
         x, theta = batch
-        loss, fom = self._nll_and_fom(x, theta)
+        pred = self(x)
+        loss = F.mse_loss(pred, theta)
         self.log("val_loss", loss, prog_bar=True)
-        self.log("val_fom_median", fom.median(), prog_bar=True)
         return loss
 
     def configure_optimizers(self):
-        return torch.optim.AdamW(
+        optimizer = torch.optim.AdamW(
             self.parameters(),
-            lr=self.hparams.lr,
+            lr=self.hparams.max_lr,
             weight_decay=self.hparams.weight_decay,
         )
 
-    @torch.no_grad()
-    def compress(self, tiles):
-        """Compress tile arrays to summaries.
+        total_steps = int(self.trainer.estimated_stepping_batches)
+        warmup_steps = self.hparams.warmup_steps
+        steps_per_epoch = total_steps // self.trainer.max_epochs
+        step_size = self.hparams.decay_every_epochs * steps_per_epoch
 
-        Parameters
-        ----------
-        tiles : np.ndarray, shape (N, n_bins, nside, nside)
-            Already normalized tiles.
+        warmup = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=1e-10, end_factor=1.0,
+            total_iters=warmup_steps,
+        )
+        decay = torch.optim.lr_scheduler.StepLR(
+            optimizer, step_size=step_size,
+            gamma=self.hparams.decay_rate,
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup, decay],
+            milestones=[warmup_steps],
+        )
 
-        Returns
-        -------
-        summaries : np.ndarray, shape (N, summary_dim)
-        """
-        self.eval()
-        x = torch.tensor(tiles, dtype=torch.float32, device=self.device)
-        return self(x).cpu().numpy()
-
-    @torch.no_grad()
-    def predict_posterior(self, tiles):
-        """Predict posterior mean and std from normalized tiles.
-
-        Parameters
-        ----------
-        tiles : np.ndarray, shape (N, n_bins, nside, nside)
-
-        Returns
-        -------
-        mu : np.ndarray, shape (N, theta_dim)
-        sigma : np.ndarray, shape (N, theta_dim)
-        """
-        self.eval()
-        x = torch.tensor(tiles, dtype=torch.float32, device=self.device)
-        t = self(x)
-        mu, L_or_sigma = self._predict_posterior(t)
-
-        if self.hparams.full_cov:
-            Sigma = L_or_sigma @ L_or_sigma.transpose(-1, -2)
-            sigma = Sigma.diagonal(dim1=-2, dim2=-1).sqrt()
-        else:
-            sigma = L_or_sigma
-
-        return mu.cpu().numpy(), sigma.cpu().numpy()
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1,
+            },
+        }

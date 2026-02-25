@@ -1,4 +1,4 @@
-"""Train field-level VMIM compressor on convergence map tiles.
+"""Train field-level compressor on convergence map tiles with MSE loss.
 
 Usage:
     modal run scripts/train_field_compressor.py
@@ -24,7 +24,7 @@ RESULTS_DIR = "/results"
 
 @app.function(
     volumes={RESULTS_DIR: vol},
-    gpu="A100-80GB",
+    gpu="H100",
     timeout=7200,
     memory=32768,
     secrets=[modal.Secret.from_name("wandb-secret")],
@@ -32,15 +32,16 @@ RESULTS_DIR = "/results"
 def train_and_evaluate(
     lmax: int = 200,
     noise_level: str = "des_y3",
-    max_epochs: int = 200,
-    lr: float = 5e-4,
-    summary_dim: int = 2,
+    max_epochs: int = 500,
+    max_lr: float = 0.008,
     backbone: str = "efficientnet_v2_s",
-    full_cov: bool = False,
-    batch_size: int = 64,
-    weight_decay: float = 1e-4,
+    batch_size: int = 128,
+    weight_decay: float = 1e-5,
+    warmup_steps: int = 500,
+    decay_rate: float = 0.85,
+    decay_every_epochs: int = 10,
 ):
-    """Train field-level VMIM compressor, log loss and FoM to wandb."""
+    """Train field-level MSE compressor, log loss to wandb."""
     import json
     import time
     from pathlib import Path
@@ -80,20 +81,20 @@ def train_and_evaluate(
     print(f"Tile shape: (4, {nside}, {nside})")
 
     # --- Build model ---
-    tag = f"field_lmax{lmax}_{noise_level}_{backbone}_s{summary_dim}"
+    tag = f"field_mse_lmax{lmax}_{noise_level}_{backbone}"
     run_dir = Path(RESULTS_DIR) / "field_compressor_runs" / tag
     run_dir.mkdir(parents=True, exist_ok=True)
 
     model = FieldLevelCompressor(
         nside=nside,
         n_bins=4,
-        summary_dim=summary_dim,
         theta_dim=2,
         backbone=backbone,
-        full_cov=full_cov,
-        lr=lr,
+        max_lr=max_lr,
         weight_decay=weight_decay,
-        theta_std=dm.train_ds.theta_std,
+        warmup_steps=warmup_steps,
+        decay_rate=decay_rate,
+        decay_every_epochs=decay_every_epochs,
     )
 
     wandb_logger = WandbLogger(
@@ -101,9 +102,10 @@ def train_and_evaluate(
         config=dict(
             lmax=lmax, noise_level=noise_level, nside=nside,
             n_train=n_train, n_val=n_val, n_test=n_test,
-            summary_dim=summary_dim, backbone=backbone, full_cov=full_cov,
-            lr=lr, batch_size=batch_size, max_epochs=max_epochs,
-            weight_decay=weight_decay,
+            backbone=backbone, loss="mse",
+            max_lr=max_lr, batch_size=batch_size, max_epochs=max_epochs,
+            weight_decay=weight_decay, warmup_steps=warmup_steps,
+            decay_rate=decay_rate, decay_every_epochs=decay_every_epochs,
         ),
         save_dir=str(run_dir),
     )
@@ -129,20 +131,54 @@ def train_and_evaluate(
     best_path = ckpt_callback.best_model_path
     if best_path:
         model = FieldLevelCompressor.load_from_checkpoint(
-            best_path, theta_std=dm.train_ds.theta_std, weights_only=False,
+            best_path, weights_only=False,
         )
     model = model.cpu().eval()
 
+    # --- MSE on all splits ---
     splits = {}
+    compressed = {}
     for split_name, ds in [("train", dm.train_ds), ("val", dm.val_ds), ("test", dm.test_ds)]:
         x, theta = ds.tensors()
         with torch.no_grad():
-            loss, foms = model._nll_and_fom(x, theta)
-        splits[split_name] = {"loss": float(loss), "fom": float(foms.median())}
-        print(f"{split_name:5s} loss: {float(loss):.4f}  FoM: {float(foms.median()):.1f}")
+            pred = model(x)
+            mse = torch.nn.functional.mse_loss(pred, theta)
+        splits[split_name] = {"mse": float(mse)}
+        compressed[split_name] = (pred.numpy(), theta.numpy())
+        print(f"{split_name:5s} MSE: {float(mse):.6f}")
+
+    # --- Train Gaussian NPE on val set, evaluate FoM ---
+    from lensing.sbi.npe import train_npe, compute_fom
+
+    print("\nTraining Gaussian NPE on val compressed summaries...")
+    val_pred, val_theta = compressed["val"]
+    test_pred, test_theta = compressed["test"]
+    train_pred, train_theta = compressed["train"]
+
+    npe = train_npe(
+        val_pred, val_theta,
+        val_summaries=test_pred, val_theta=test_theta,
+        max_epochs=500, patience=30,
+    )
+    npe = npe.cpu().eval()
+
+    # Un-normalize FoM: NPE works in normalized theta space,
+    # scale by 1/prod(theta_std) to get physical FoM
+    theta_std_prod = float(dm.train_ds.theta_std.prod())
+
+    for split_name, (pred, theta) in compressed.items():
+        fom_median, fom_lo, fom_hi, fom_all = compute_fom(npe, pred)
+        # Convert to physical units
+        fom_median /= theta_std_prod
+        fom_lo /= theta_std_prod
+        fom_hi /= theta_std_prod
+        splits[split_name]["fom"] = fom_median
+        splits[split_name]["fom_lo"] = fom_lo
+        splits[split_name]["fom_hi"] = fom_hi
+        print(f"{split_name:5s} FoM: {fom_median:.1f} [{fom_lo:.1f}, {fom_hi:.1f}]")
 
     wandb_logger.experiment.summary.update({
-        f"{s}/loss": v["loss"] for s, v in splits.items()
+        f"{s}/mse": v["mse"] for s, v in splits.items()
     })
     wandb_logger.experiment.summary.update({
         f"{s}/fom": v["fom"] for s, v in splits.items()
@@ -151,11 +187,14 @@ def train_and_evaluate(
     result = dict(
         lmax=lmax, noise_level=noise_level, nside=nside,
         n_train=n_train, n_val=n_val, n_test=n_test,
-        summary_dim=summary_dim, backbone=backbone, full_cov=full_cov,
-        lr=lr, batch_size=batch_size, weight_decay=weight_decay,
-        train_loss=splits["train"]["loss"], train_fom=splits["train"]["fom"],
-        val_loss=splits["val"]["loss"], val_fom=splits["val"]["fom"],
-        test_loss=splits["test"]["loss"], test_fom=splits["test"]["fom"],
+        backbone=backbone,
+        max_lr=max_lr, batch_size=batch_size, weight_decay=weight_decay,
+        train_mse=splits["train"]["mse"],
+        val_mse=splits["val"]["mse"],
+        test_mse=splits["test"]["mse"],
+        train_fom=splits["train"]["fom"],
+        val_fom=splits["val"]["fom"],
+        test_fom=splits["test"]["fom"],
         epochs_trained=trainer.current_epoch,
         elapsed_s=time.time() - t0,
     )
@@ -173,19 +212,23 @@ def train_and_evaluate(
 def main(
     lmax: int = 200,
     noise_level: str = "des_y3",
-    max_epochs: int = 1000,
-    lr: float = 5e-4,
-    summary_dim: int = 2,
+    max_epochs: int = 500,
+    max_lr: float = 0.008,
     backbone: str = "efficientnet_v2_s",
-    full_cov: bool = False,
     batch_size: int = 128,
-    weight_decay: float = 1e-4,
+    weight_decay: float = 1e-5,
+    warmup_steps: int = 500,
+    decay_rate: float = 0.85,
+    decay_every_epochs: int = 10,
 ):
     result = train_and_evaluate.remote(
         lmax=lmax, noise_level=noise_level,
-        max_epochs=max_epochs, lr=lr, summary_dim=summary_dim,
-        backbone=backbone, full_cov=full_cov,
+        max_epochs=max_epochs, max_lr=max_lr,
+        backbone=backbone,
         batch_size=batch_size, weight_decay=weight_decay,
+        warmup_steps=warmup_steps, decay_rate=decay_rate,
+        decay_every_epochs=decay_every_epochs,
     )
-    print(f"\nTrain FoM: {result['train_fom']:.1f}  Val FoM: {result['val_fom']:.1f}  Test FoM: {result['test_fom']:.1f}")
+    print(f"\nTrain MSE: {result['train_mse']:.6f}  Val MSE: {result['val_mse']:.6f}  Test MSE: {result['test_mse']:.6f}")
+    print(f"Train FoM: {result['train_fom']:.1f}  Val FoM: {result['val_fom']:.1f}  Test FoM: {result['test_fom']:.1f}")
     print(f"Trained {result['epochs_trained']} epochs in {result['elapsed_s']:.0f}s")

@@ -34,31 +34,31 @@ def load_tiles_parquet(parquet_dir):
 
 
 class TileDataset:
-    """Normalized tiles + theta, with stats kept for un-normalization."""
+    """Normalized tiles + theta stored as tensors."""
 
     def __init__(self, tiles, theta, tile_mean, tile_std, theta_mean, theta_std):
-        self.tiles = (tiles - tile_mean[None, :, None, None]) / tile_std[None, :, None, None]
-        self.theta = (theta - theta_mean) / theta_std
+        # Normalize in numpy, then convert to tensors once
+        tiles = (tiles - tile_mean[None, :, None, None]) / tile_std[None, :, None, None]
+        theta = (theta - theta_mean) / theta_std
+        self.x = torch.tensor(tiles, dtype=torch.float32)
+        self.y = torch.tensor(theta, dtype=torch.float32)
         self.tile_mean = tile_mean
         self.tile_std = tile_std
         self.theta_mean = theta_mean
         self.theta_std = theta_std
 
     def __len__(self):
-        return len(self.tiles)
+        return len(self.x)
 
     def tensors(self):
         """Return (tiles, theta) as float32 tensors."""
-        return (
-            torch.tensor(self.tiles, dtype=torch.float32),
-            torch.tensor(self.theta, dtype=torch.float32),
-        )
+        return self.x, self.y
 
 
 class TileDataModule(L.LightningDataModule):
     """Lightning DataModule for tile images from HuggingFace dataset.
 
-    3-way split (60/20/20%), shuffled. Same logic as SpectraDataModule.
+    3-way split (80/10/10%), shuffled. Same logic as SpectraDataModule.
     Per-channel normalization stats computed from train split only.
     """
 
@@ -70,11 +70,13 @@ class TileDataModule(L.LightningDataModule):
         self.train_ds = None
         self.val_ds = None
         self.test_ds = None
+        self._train_dl = None
+        self._val_dl = None
 
     def setup(self, stage=None):
         tiles, theta = load_tiles_parquet(self.parquet_dir)
 
-        # Shuffle and split 60/20/20 — mirrors SpectraDataModule exactly
+        # Shuffle and split 80/10/10 — mirrors SpectraDataModule exactly
         rng = np.random.default_rng(self.seed)
         idx = np.arange(len(theta))
         rng.shuffle(idx)
@@ -83,8 +85,8 @@ class TileDataModule(L.LightningDataModule):
         theta = theta[idx]
 
         n = len(idx)
-        n_train = int(0.6 * n)
-        n_val = int(0.2 * n)
+        n_train = int(0.8 * n)
+        n_val = int(0.1 * n)
 
         train_mask = np.zeros(n, dtype=bool)
         train_mask[:n_train] = True
@@ -108,10 +110,18 @@ class TileDataModule(L.LightningDataModule):
         self.val_ds = TileDataset(tiles[val_mask], theta[val_mask], *norm)
         self.test_ds = TileDataset(tiles[test_mask], theta[test_mask], *norm)
 
+        # Pre-build DataLoaders once (data is in-memory tensors, no workers needed)
+        self._train_dl = DataLoader(
+            TensorDataset(self.train_ds.x, self.train_ds.y),
+            batch_size=self.batch_size, shuffle=True, pin_memory=True,
+        )
+        self._val_dl = DataLoader(
+            TensorDataset(self.val_ds.x, self.val_ds.y),
+            batch_size=self.batch_size, pin_memory=True,
+        )
+
     def train_dataloader(self):
-        x, y = self.train_ds.tensors()
-        return DataLoader(TensorDataset(x, y), batch_size=self.batch_size, shuffle=True, num_workers=4, persistent_workers=True, pin_memory=True)
+        return self._train_dl
 
     def val_dataloader(self):
-        x, y = self.val_ds.tensors()
-        return DataLoader(TensorDataset(x, y), batch_size=self.batch_size, num_workers=4, persistent_workers=True, pin_memory=True)
+        return self._val_dl
