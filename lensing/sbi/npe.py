@@ -32,7 +32,9 @@ class GaussianNPE(L.LightningModule):
         Learning rate.
     """
 
-    def __init__(self, input_dim=2, theta_dim=2, lr=1e-3):
+    def __init__(self, input_dim=2, theta_dim=2, lr=1e-3,
+                 decay_start=10000, decay_every=2000, decay_factor=0.5,
+                 theta_std_prod=1.0):
         super().__init__()
         self.save_hyperparameters()
         self.theta_dim = theta_dim
@@ -100,10 +102,32 @@ class GaussianNPE(L.LightningModule):
         x, theta = batch
         loss = self._nll(x, theta)
         self.log("val_loss", loss, prog_bar=True)
+
+        # Log FoM on validation batch (both normalized and physical)
+        _, L = self.forward(x)
+        log_det_sigma = 2.0 * L.diagonal(dim1=-2, dim2=-1).log().sum(-1)
+        fom = torch.exp(-0.5 * log_det_sigma)
+        fom_phys = fom / self.hparams.theta_std_prod
+        self.log("val_fom", fom_phys.median(), prog_bar=True)
         return loss
 
     def configure_optimizers(self):
-        return torch.optim.AdamW(self.parameters(), lr=self.hparams.lr)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr)
+        decay_start = self.hparams.decay_start
+        decay_every = self.hparams.decay_every
+        decay_factor = self.hparams.decay_factor
+
+        def lr_lambda(step):
+            if step < decay_start:
+                return 1.0
+            n_halves = (step - decay_start) // decay_every
+            return decay_factor ** n_halves
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {"scheduler": scheduler, "interval": "step"},
+        }
 
     @torch.no_grad()
     def predict_fom(self, x):
@@ -127,6 +151,30 @@ class GaussianNPE(L.LightningModule):
         log_det_sigma = 2.0 * L.diagonal(dim1=-2, dim2=-1).log().sum(-1)
         foms = torch.exp(-0.5 * log_det_sigma).cpu().numpy()
         return foms
+
+
+    @torch.no_grad()
+    def compute_zscores(self, x, theta):
+        """Compute z-scores: z = L^{-1}(theta - mu).
+
+        If well-calibrated, each component of z ~ N(0, 1).
+
+        Parameters
+        ----------
+        x : np.ndarray, shape (N, input_dim)
+        theta : np.ndarray, shape (N, theta_dim)
+
+        Returns
+        -------
+        z : np.ndarray, shape (N, theta_dim)
+        """
+        self.eval()
+        x_t = torch.tensor(x, dtype=torch.float32, device=self.device)
+        theta_t = torch.tensor(theta, dtype=torch.float32, device=self.device)
+        mu, L = self.forward(x_t)
+        diff = theta_t - mu
+        z = torch.linalg.solve_triangular(L, diff.unsqueeze(-1), upper=False)
+        return z.squeeze(-1).cpu().numpy()
 
 
 def train_npe(summaries, theta, val_summaries=None, val_theta=None,

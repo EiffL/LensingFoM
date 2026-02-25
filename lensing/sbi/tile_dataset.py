@@ -57,6 +57,77 @@ class TileDataset:
         return self.x, self.y
 
 
+def _augment_tile(x):
+    """Random augmentation on a single tile: rotations, flips, circular rolls.
+
+    Parameters
+    ----------
+    x : Tensor, shape (C, H, W)
+    """
+    k = torch.randint(0, 4, (1,)).item()
+    if k > 0:
+        x = torch.rot90(x, k, dims=[1, 2])
+    if torch.rand(1).item() > 0.5:
+        x = torch.flip(x, dims=[2])
+    if torch.rand(1).item() > 0.5:
+        x = torch.flip(x, dims=[1])
+    H, W = x.shape[1], x.shape[2]
+    x = torch.roll(x, shifts=torch.randint(0, H, (1,)).item(), dims=1)
+    x = torch.roll(x, shifts=torch.randint(0, W, (1,)).item(), dims=2)
+    return x
+
+
+def batch_compress(tile_ds, compressor, batch_size=256, augment=False,
+                   n_augmentations=1):
+    """Compress tiles in batches through a frozen compressor.
+
+    Much faster than per-sample compression: processes full batches on GPU
+    instead of individual tiles.
+
+    Parameters
+    ----------
+    tile_ds : TileDataset
+        Dataset with .x (tiles) and .y (theta) tensors.
+    compressor : nn.Module
+        Frozen compressor model.
+    batch_size : int
+        Batch size for compression forward passes.
+    augment : bool
+        Whether to apply random augmentations before compressing.
+    n_augmentations : int
+        Number of augmented copies to produce per tile.
+        Only used when augment=True. Total output size = N * n_augmentations.
+
+    Returns
+    -------
+    summaries : Tensor, shape (N * n_augmentations, summary_dim)
+    theta : Tensor, shape (N * n_augmentations, theta_dim)
+    """
+    params = list(compressor.parameters())
+    device = params[0].device if params else torch.device("cpu")
+
+    all_summaries = []
+    all_theta = []
+
+    n_reps = n_augmentations if augment else 1
+    for _ in range(n_reps):
+        for start in range(0, len(tile_ds), batch_size):
+            end = min(start + batch_size, len(tile_ds))
+            tiles = tile_ds.x[start:end]  # (B, C, H, W)
+            theta = tile_ds.y[start:end]  # (B, 2)
+
+            if augment:
+                tiles = torch.stack([_augment_tile(t) for t in tiles])
+
+            with torch.no_grad():
+                summaries = compressor(tiles.to(device)).cpu()
+
+            all_summaries.append(summaries)
+            all_theta.append(theta)
+
+    return torch.cat(all_summaries), torch.cat(all_theta)
+
+
 class CompressedTileDataset(Dataset):
     """Wraps tiles + frozen compressor for on-the-fly augmented compression.
 
@@ -73,32 +144,12 @@ class CompressedTileDataset(Dataset):
     def __len__(self):
         return len(self.x)
 
-    @staticmethod
-    def _augment_tile(x):
-        """Random augmentation on a single tile: rotations, flips, circular rolls.
-
-        Parameters
-        ----------
-        x : Tensor, shape (C, H, W)
-        """
-        k = torch.randint(0, 4, (1,)).item()
-        if k > 0:
-            x = torch.rot90(x, k, dims=[1, 2])
-        if torch.rand(1).item() > 0.5:
-            x = torch.flip(x, dims=[2])
-        if torch.rand(1).item() > 0.5:
-            x = torch.flip(x, dims=[1])
-        H, W = x.shape[1], x.shape[2]
-        x = torch.roll(x, shifts=torch.randint(0, H, (1,)).item(), dims=1)
-        x = torch.roll(x, shifts=torch.randint(0, W, (1,)).item(), dims=2)
-        return x
-
     def __getitem__(self, idx):
         tile = self.x[idx]   # (C, H, W)
         theta = self.y[idx]  # (2,)
 
         if self.augment:
-            tile = self._augment_tile(tile)
+            tile = _augment_tile(tile)
 
         with torch.no_grad():
             params = list(self.compressor.parameters())
