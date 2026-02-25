@@ -3,7 +3,7 @@
 import numpy as np
 import torch
 from datasets import load_dataset
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Dataset, TensorDataset
 
 import lightning as L
 
@@ -55,6 +55,55 @@ class TileDataset:
     def tensors(self):
         """Return (tiles, theta) as float32 tensors."""
         return self.x, self.y
+
+
+class CompressedTileDataset(Dataset):
+    """Wraps tiles + frozen compressor for on-the-fly augmented compression.
+
+    Each __getitem__ call optionally augments the tile, runs it through
+    the frozen compressor, and returns (compressed_summary, theta).
+    """
+
+    def __init__(self, tile_ds, compressor, augment=True):
+        self.x = tile_ds.x          # (N, 4, H, W) normalized tiles
+        self.y = tile_ds.y          # (N, 2) normalized theta
+        self.compressor = compressor
+        self.augment = augment
+
+    def __len__(self):
+        return len(self.x)
+
+    @staticmethod
+    def _augment_tile(x):
+        """Random augmentation on a single tile: rotations, flips, circular rolls.
+
+        Parameters
+        ----------
+        x : Tensor, shape (C, H, W)
+        """
+        k = torch.randint(0, 4, (1,)).item()
+        if k > 0:
+            x = torch.rot90(x, k, dims=[1, 2])
+        if torch.rand(1).item() > 0.5:
+            x = torch.flip(x, dims=[2])
+        if torch.rand(1).item() > 0.5:
+            x = torch.flip(x, dims=[1])
+        H, W = x.shape[1], x.shape[2]
+        x = torch.roll(x, shifts=torch.randint(0, H, (1,)).item(), dims=1)
+        x = torch.roll(x, shifts=torch.randint(0, W, (1,)).item(), dims=2)
+        return x
+
+    def __getitem__(self, idx):
+        tile = self.x[idx]   # (C, H, W)
+        theta = self.y[idx]  # (2,)
+
+        if self.augment:
+            tile = self._augment_tile(tile)
+
+        with torch.no_grad():
+            summary = self.compressor(tile.unsqueeze(0)).squeeze(0)
+
+        return summary, theta
 
 
 class TileDataModule(L.LightningDataModule):

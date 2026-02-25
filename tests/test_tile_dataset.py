@@ -110,3 +110,60 @@ def test_tile_data_module_no_fiducial(tmp_path):
     assert dm.fiducial_ds is None
     total = len(dm.train_ds) + len(dm.val_ds) + len(dm.test_ds)
     assert total == 50 * 2
+
+
+def test_compressed_tile_dataset_augmentation():
+    """Same tile should produce different compressed outputs across calls."""
+    import torch
+    from lensing.sbi.tile_dataset import TileDataset, CompressedTileDataset
+
+    # Mock compressor sensitive to spatial layout (flatten first row)
+    class MockCompressor(torch.nn.Module):
+        def forward(self, x):
+            return x[:, :, 0, :].reshape(x.shape[0], -1)  # (B, 4, H, W) -> (B, 4*W)
+
+    tiles = np.random.randn(10, 4, 8, 8).astype(np.float32)
+    theta = np.random.randn(10, 2).astype(np.float32)
+    norm = (np.zeros(4, dtype=np.float32), np.ones(4, dtype=np.float32),
+            np.zeros(2, dtype=np.float32), np.ones(2, dtype=np.float32))
+
+    tile_ds = TileDataset(tiles, theta, *norm)
+    compressor = MockCompressor()
+    cds = CompressedTileDataset(tile_ds, compressor, augment=True)
+
+    assert len(cds) == 10
+
+    # Get same index many times — at least one should differ due to augmentation
+    s1, t1 = cds[0]
+    any_different = False
+    for _ in range(20):
+        s_new, t_new = cds[0]
+        # Theta should always be identical
+        assert torch.allclose(t1, t_new)
+        if not torch.allclose(s1, s_new):
+            any_different = True
+            break
+    assert any_different, "Augmentation should produce varying outputs"
+
+
+def test_compressed_tile_dataset_no_augmentation():
+    """Without augmentation, same tile should give same compressed output."""
+    import torch
+    from lensing.sbi.tile_dataset import TileDataset, CompressedTileDataset
+
+    class MockCompressor(torch.nn.Module):
+        def forward(self, x):
+            return x.mean(dim=(2, 3))
+
+    tiles = np.random.randn(10, 4, 8, 8).astype(np.float32)
+    theta = np.random.randn(10, 2).astype(np.float32)
+    norm = (np.zeros(4, dtype=np.float32), np.ones(4, dtype=np.float32),
+            np.zeros(2, dtype=np.float32), np.ones(2, dtype=np.float32))
+
+    tile_ds = TileDataset(tiles, theta, *norm)
+    compressor = MockCompressor()
+    cds = CompressedTileDataset(tile_ds, compressor, augment=False)
+
+    s1, _ = cds[0]
+    s2, _ = cds[0]
+    assert torch.allclose(s1, s2)
