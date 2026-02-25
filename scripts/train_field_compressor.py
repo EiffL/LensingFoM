@@ -191,7 +191,7 @@ def main(
     weight_decay: float = 1e-5,
     warmup_steps: int = 500,
     decay_rate: float = 0.85,
-    decay_every_epochs: int = 10,
+    decay_every_epochs: int = 20,
 ):
     result = train_compressor.remote(
         lmax=lmax, noise_level=noise_level,
