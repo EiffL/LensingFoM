@@ -97,8 +97,13 @@ def train_compressor(
         decay_every_epochs=decay_every_epochs,
     )
 
+    # Deterministic wandb ID from tag so re-runs resume the same run
+    import hashlib
+    wandb_id = hashlib.md5(tag.encode()).hexdigest()[:8]
+
     wandb_logger = WandbLogger(
         project="LensingFoM", entity="eiffl", name=tag,
+        id=wandb_id, resume="allow",
         config=dict(
             lmax=lmax, noise_level=noise_level, nside=nside,
             n_train=n_train, n_val=n_val, n_test=n_test,
@@ -110,25 +115,37 @@ def train_compressor(
         save_dir=str(run_dir),
     )
 
-    ckpt_callback = ModelCheckpoint(
+    best_callback = ModelCheckpoint(
         dirpath=str(run_dir), filename="best",
         monitor="val_loss", mode="min",
     )
+    last_callback = ModelCheckpoint(
+        dirpath=str(run_dir), filename="last",
+        every_n_epochs=1,
+    )
 
-    # --- Train ---
+    # --- Train (resume from last checkpoint if available) ---
+    resume_ckpt = run_dir / "last.ckpt"
+    if resume_ckpt.exists():
+        print(f"Resuming from {resume_ckpt}")
+    else:
+        resume_ckpt = None
+
     trainer = L.Trainer(
         max_epochs=max_epochs,
-        callbacks=[ckpt_callback],
+        callbacks=[best_callback, last_callback],
         enable_progress_bar=True,
         enable_model_summary=False,
         logger=wandb_logger,
         accelerator="auto",
         precision="bf16-mixed",
     )
-    trainer.fit(model, dm)
+    trainer.fit(model, dm, ckpt_path=str(resume_ckpt) if resume_ckpt else None)
+
+    vol.commit()
 
     # --- Evaluate MSE on all splits ---
-    best_path = ckpt_callback.best_model_path
+    best_path = best_callback.best_model_path
     if best_path:
         model = FieldLevelCompressor.load_from_checkpoint(
             best_path, weights_only=False,
