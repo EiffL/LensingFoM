@@ -16,7 +16,7 @@
 ### What's next
 
 - **Phase 2b: Pseudo-Cl with NaMaster** — Measure pseudo-Cl power spectra on each tile using NaMaster for mode-coupling correction
-- **Phase 2c: SBI with Neural Compression** — Train neural network compressor on tiles, run SBI for FoM estimation
+- **Phase 2c: SBI with Neural Compression** — Two decoupled stages: (1) train EfficientNet MSE compressor on tiles, (2) train Gaussian NPE on frozen compressor outputs with on-the-fly augmentation. FoM evaluated on held-out fiducial cosmology (sim 109, 12 tiles).
 - **Phase 2d: FoM Comparison** — Compare SBI vs 2pt FoM as a function of ell_max
 
 ## Repository Structure
@@ -33,8 +33,11 @@
   - `download_data.sh` — Download Gower Street sim00001 + DES Y3 FITS
   - `healpix_to_tiles.py` — Standalone tile extraction demo
   - `lmax_filtering_demo.py` — Harmonic filtering demo
+  - `train_field_compressor.py` — Modal: train EfficientNet compressor (stage 1)
+  - `train_field_npe.py` — Modal: train Gaussian NPE on frozen compressor (stage 2)
 - `notebooks/01_validate_raytracing.ipynb` — End-to-end validation
 - `tests/test_tiles.py` — Tests for tile extraction
+- `tests/test_tile_dataset.py` — Tests for tile dataset loading and splitting
 - `data/` — Simulation and observational data (not committed)
 - `gower_street_runs.csv` — Cosmological parameters for all 791 Gower Street sims
 
@@ -46,6 +49,8 @@
 - 4 tomographic bins from DES Y3 MagLim source n(z)
 - 10 power spectra total: 4 auto + 6 cross
 - Tile extraction: 3 rotations x 4 equatorial tiles = 12 tiles per sim per lmax
+- Fiducial cosmology: sim 109 (Omega_m=0.3007, sigma_8=0.8047) — held out from all training, used for FoM evaluation
+- Data split (field compressor): 70% compressor train / 25% NPE train+compressor val / 5% test (tile-level split, fiducial excluded)
 - lmax-to-nside mapping: {200: 128, 400: 256, 600: 256, 800: 512, 1000: 512}
 - Euler rotations in ZYZ convention (healpy default)
 - 3 noise levels: "noiseless" (no noise), "des_y3" (DES Y3 shape noise), "lsst_y10" (LSST Y10 shape noise)
@@ -77,6 +82,10 @@ modal run pipeline.py --stage 5   # Build power spectra dataset
 # Single simulation (stages 1-2 only)
 modal run pipeline.py --stage 1 --sim-id 1
 modal run pipeline.py --stage 2 --sim-id 1
+
+# Field compressor pipeline (Phase 2c)
+modal run scripts/train_field_compressor.py --lmax 200 --noise-level des_y3
+modal run scripts/train_field_npe.py --lmax 200 --noise-level des_y3
 ```
 
 ## Data Sources
